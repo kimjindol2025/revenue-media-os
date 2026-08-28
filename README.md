@@ -33,3 +33,27 @@ integration smoke test, not evidence of real search ranking or ad revenue.
   adapter boundaries with explicit provider statuses.
 - Telemetry persistence with explicit provider status.
 - Daily report and audit log.
+
+## Stage 1.6 hardening
+
+- Schema version 2 with explicit migration history and foreign-key checks.
+- Raw observations preserve `NULL` for missing values; fixture data is marked
+  `FIXTURE` and real observations are marked `OBSERVED`.
+- Real velocity is calculated after inserting the observation, with inclusive
+  lower time-window boundaries.
+- Opportunity inputs carry status/provenance; missing real inputs cannot become
+  `FAST_WRITE` or `MONEY_WRITE`, and unknown risk becomes `REVIEW_REQUIRED`.
+- FAST trend signal and final FAST investment decision are separate concepts.
+- GSC and GA4 payloads use separate `search_metrics` and `analytics_metrics`
+  tables. Reports derive provider status from stored rows.
+- Site Fit evaluates every eligible candidate and records component scores,
+  candidate scores, reason, and router version before selection.
+- Cost rows may be linked to opportunity, content, and publication, but
+  `content_economics()` counts each row once. Monthly reports use a documented
+  rolling 30-day window; all report dates are rendered in configured timezone.
+- Idempotency keys cover observations, signals, opportunities, publications,
+  telemetry, and costs.
+
+The GitHub Actions matrix runs the same unit tests and compile/static checks on
+Python 3.11 and 3.12. Real SNS, SERP, rank, traffic, revenue, and publisher
+accounts remain intentionally unconfigured in this stage.

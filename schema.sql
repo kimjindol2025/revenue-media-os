@@ -19,19 +19,21 @@ CREATE TABLE IF NOT EXISTS signal_observations (
 CREATE TABLE IF NOT EXISTS signals (
   id INTEGER PRIMARY KEY, keyword_id INTEGER NOT NULL REFERENCES keywords(id),
   source TEXT NOT NULL, country TEXT NOT NULL, language TEXT NOT NULL,
-  mention_count INTEGER NOT NULL, unique_authors INTEGER, engagement INTEGER,
+  mention_count INTEGER, unique_authors INTEGER, engagement INTEGER,
   velocity_1h REAL NOT NULL, velocity_3h REAL NOT NULL, velocity_6h REAL NOT NULL,
   velocity_12h REAL NOT NULL, velocity_24h REAL NOT NULL, acceleration REAL NOT NULL,
   platform_count INTEGER NOT NULL DEFAULT 1, country_count INTEGER NOT NULL DEFAULT 1,
   first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, status TEXT NOT NULL,
   is_fast_candidate INTEGER NOT NULL DEFAULT 0, observation_id INTEGER REFERENCES signal_observations(id),
-  idempotency_key TEXT UNIQUE
+  idempotency_key TEXT UNIQUE, trend_state TEXT NOT NULL DEFAULT 'NORMAL'
 );
 CREATE TABLE IF NOT EXISTS opportunities (
   id INTEGER PRIMARY KEY, keyword_id INTEGER NOT NULL REFERENCES keywords(id),
   signal_id INTEGER REFERENCES signals(id), decision TEXT NOT NULL, score REAL NOT NULL,
   decision_reason TEXT NOT NULL, score_components TEXT NOT NULL,
-  engine_version TEXT NOT NULL, created_at TEXT NOT NULL, idempotency_key TEXT UNIQUE
+  engine_version TEXT NOT NULL, created_at TEXT NOT NULL, idempotency_key TEXT UNIQUE,
+  decision_mode TEXT NOT NULL DEFAULT 'FIXTURE', input_statuses TEXT NOT NULL DEFAULT '{}',
+  risk_class TEXT NOT NULL DEFAULT 'unknown', risk_score REAL, risk_reason TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS serp_snapshots (
   id INTEGER PRIMARY KEY, opportunity_id INTEGER NOT NULL REFERENCES opportunities(id),
@@ -78,6 +80,18 @@ CREATE TABLE IF NOT EXISTS traffic_metrics (
   direct_traffic INTEGER, engagement_time REAL, page_views INTEGER,
   provider_status TEXT NOT NULL, idempotency_key TEXT UNIQUE
 );
+CREATE TABLE IF NOT EXISTS search_metrics (
+  id INTEGER PRIMARY KEY, publication_id INTEGER NOT NULL REFERENCES publications(id),
+  checkpoint TEXT NOT NULL DEFAULT 'custom', captured_at TEXT NOT NULL, query TEXT, page TEXT, country TEXT,
+  device TEXT, impressions INTEGER, clicks INTEGER, ctr REAL, position REAL,
+  provider_status TEXT NOT NULL, idempotency_key TEXT UNIQUE
+);
+CREATE TABLE IF NOT EXISTS analytics_metrics (
+  id INTEGER PRIMARY KEY, publication_id INTEGER NOT NULL REFERENCES publications(id),
+  checkpoint TEXT NOT NULL DEFAULT 'custom', captured_at TEXT NOT NULL, source TEXT, medium TEXT, country TEXT,
+  sessions INTEGER, users INTEGER, engagement_time REAL, page_views INTEGER,
+  provider_status TEXT NOT NULL, idempotency_key TEXT UNIQUE
+);
 CREATE TABLE IF NOT EXISTS revenue_metrics (
   id INTEGER PRIMARY KEY, publication_id INTEGER NOT NULL REFERENCES publications(id),
   checkpoint TEXT NOT NULL DEFAULT 'custom', captured_at TEXT NOT NULL, adsense_revenue REAL,
@@ -107,3 +121,5 @@ CREATE INDEX IF NOT EXISTS idx_signals_last_seen ON signals(last_seen_at);
 CREATE INDEX IF NOT EXISTS idx_observations_keyword_time ON signal_observations(keyword_id,observed_at);
 CREATE INDEX IF NOT EXISTS idx_rank_pub_time ON rank_history(publication_id,captured_at);
 CREATE INDEX IF NOT EXISTS idx_revenue_pub_time ON revenue_metrics(publication_id,captured_at);
+CREATE INDEX IF NOT EXISTS idx_search_pub_time ON search_metrics(publication_id);
+CREATE INDEX IF NOT EXISTS idx_analytics_pub_time ON analytics_metrics(publication_id);

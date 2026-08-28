@@ -89,12 +89,12 @@ class GoogleAPIProvider:
 class PublisherRouter:
     def __init__(self, db, adapters=None): self.db=db; self.adapters=adapters or {"local": None}
     def select_site_result(self, keyword, country, language, topic=None, authority_tags=None):
-        clauses=["country=?", "language=?", "health_status != 'BLOCKED'", "policy_status != 'BLOCKED'"]; args=[country,language]
-        if topic: clauses.append("topic LIKE ?"); args.append("%"+topic+"%")
-        row=self.db.conn.execute("SELECT * FROM sites WHERE " + " AND ".join(clauses) + " ORDER BY average_rpm DESC, average_revenue DESC LIMIT 1",args).fetchone()
-        if not row: return None
-        topic_fit=1.0 if not topic or topic.lower() in row["topic"].lower() else .3; authority_fit=1.0 if not authority_tags else min(1.0,sum(a in row["authority_tags"] for a in authority_tags)/len(authority_tags)); historical=min(1.0,float(row["average_revenue"])/100); score=.3*topic_fit+.2*authority_fit+.2+.15+.15*historical
-        return {"site":row,"site_fit_score":score,"selection_reason":f"topic={topic_fit:.2f}; authority={authority_fit:.2f}; country=1.00; language=1.00; historical_revenue={historical:.2f}"}
+        rows=self.db.conn.execute("SELECT * FROM sites WHERE country=? AND language=? AND health_status != 'BLOCKED' AND policy_status != 'BLOCKED'",(country,language)).fetchall()
+        if not rows: return None
+        keyword_terms=set((keyword or "").lower().split()); candidates=[]
+        for row in rows:
+            topic_text=(row["topic"] or "").lower(); authority_text=(row["authority_tags"] or "").lower(); topic_fit=1.0 if not topic or topic.lower() in topic_text or any(t in topic_text for t in keyword_terms) else .15; authority_fit=1.0 if not authority_tags else min(1.0,sum(a.lower() in authority_text for a in authority_tags)/len(authority_tags)); keyword_fit=1.0 if any(t in topic_text or t in authority_text for t in keyword_terms) else .1; historical=min(1.0,float(row["average_revenue"])/100); policy_fit=1.0 if row["policy_status"] in {"OK","UNKNOWN"} else 0; health_fit=1.0 if row["health_status"] in {"OK","UNKNOWN"} else 0; score=.25*topic_fit+.2*authority_fit+.15*keyword_fit+.15*historical+.15*policy_fit+.1*health_fit; candidates.append((score,row,{"topic_fit":topic_fit,"authority_fit":authority_fit,"country_fit":1.0,"language_fit":1.0,"historical_revenue_fit":historical,"policy_fit":policy_fit,"health_fit":health_fit}))
+        score,row,components=max(candidates,key=lambda item:item[0]); reason="; ".join(f"{k}={v:.2f}" for k,v in components.items()); return {"site":row,"site_fit_score":score,"candidate_scores":[{"site_id":r["id"],"score":s,"components":c} for s,r,c in candidates],"selection_reason":reason,"router_version":"SiteFit-v2",**components}
     def select_site(self, keyword, country, language, topic=None):
         result=self.select_site_result(keyword,country,language,topic)
         return result["site"] if result else None
