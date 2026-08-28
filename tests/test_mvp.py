@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 sys.path.insert(0,str(Path(__file__).parents[1]/"src"))
 from revenue_media_os.core import *
+from revenue_media_os.providers import GoogleAPIProvider, OpenSERPProvider, PublisherRouter, WordPressPublisher
 
 class MvpTest(unittest.TestCase):
     def setUp(self): self.db=IntelligenceDB()
@@ -21,5 +22,12 @@ class MvpTest(unittest.TestCase):
         result=Scheduler(TrendSensor(self.db)).run_once([{"keyword":"scheduled","source":"fixture","samples":[2,5,8,12,20]}]); self.assertEqual(result["interval"],"1h"); self.assertEqual(len(result["signals"]),1)
         Telemetry(self.db).record_cost("article","local",amount=0.12,input_tokens=10,output_tokens=20,status="PASS")
         self.assertEqual(daily_report(self.db)["ai_cost"],0.12)
+
+    def test_external_adapters_are_explicitly_unconfigured(self):
+        self.assertEqual(OpenSERPProvider().search("x").status,"NOT_CONFIGURED")
+        self.assertEqual(WordPressPublisher().publish("x","y").status,"NOT_CONFIGURED")
+        self.assertEqual(GoogleAPIProvider(None).query("reports").status,"NOT_CONFIGURED")
+        site=self.db.site(tenant_id="t",country="US",language="en",topic="tools",platform="local",average_rpm=4)
+        self.assertEqual(PublisherRouter(self.db).select_site("x","US","en","tools")["id"],site)
 
 if __name__ == "__main__": unittest.main()

@@ -28,5 +28,7 @@ integration smoke test, not evidence of real search ranking or ad revenue.
   `FAST_CANDIDATE` detection.
 - SERP analysis, content planning, article generation, site fit selection.
 - Safe local publisher adapter and publisher interface for WordPress/Blogger.
+- Dependency-free RSS, OpenSERP, WordPress REST, and Google authenticated API
+  adapter boundaries with explicit provider statuses.
 - Telemetry persistence with explicit provider status.
 - Daily report and audit log.
