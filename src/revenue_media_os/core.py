@@ -5,12 +5,18 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from .providers import PublisherRouter
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 UTC = timezone.utc
 
 
 def now():
     return datetime.now(UTC).isoformat()
+
+
+def _bucket_bounds(observed_at):
+    moment = datetime.fromisoformat(observed_at)
+    start = moment.replace(minute=0, second=0, microsecond=0)
+    return start.isoformat(), (start + timedelta(hours=1)).isoformat()
 
 
 class IntelligenceDB:
@@ -90,6 +96,33 @@ class IntelligenceDB:
             self.conn.execute("INSERT INTO migration_history(from_version,to_version,migration,applied_at) VALUES(?,?,?,?)", (0, SCHEMA_VERSION, "initial_schema", now()))
             self.conn.commit()
 
+        if version < 3:
+            # Stage 1.6 Follow-up: raw observations are retained, while their
+            # normalized hour bucket becomes an explicit persisted boundary.
+            self.conn.commit(); self.conn.execute("PRAGMA foreign_keys = OFF")
+            obs_cols = self._columns("signal_observations")
+            if "bucket_start" not in obs_cols:
+                self.conn.execute("CREATE TABLE signal_observations_v3 (id INTEGER PRIMARY KEY, keyword_id INTEGER NOT NULL REFERENCES keywords(id), source TEXT NOT NULL, mention_count INTEGER, unique_authors INTEGER, engagement INTEGER, observed_at TEXT NOT NULL, bucket_start TEXT NOT NULL, bucket_end TEXT NOT NULL, status TEXT NOT NULL, idempotency_key TEXT UNIQUE)")
+                rows = self.conn.execute("SELECT id,keyword_id,source,mention_count,unique_authors,engagement,observed_at,status,idempotency_key FROM signal_observations").fetchall()
+                for row in rows:
+                    start, end = _bucket_bounds(row[6]); self.conn.execute("INSERT INTO signal_observations_v3 VALUES(?,?,?,?,?,?,?,?,?,?,?)", (row[0], row[1], row[2], row[3], row[4], row[5], row[6], start, end, row[7], row[8]))
+                self.conn.execute("DROP TABLE signal_observations"); self.conn.execute("ALTER TABLE signal_observations_v3 RENAME TO signal_observations")
+            signal_cols = self._columns("signals")
+            signal_info = {r[1]: r for r in self.conn.execute("PRAGMA table_info(signals)")}
+            signal_fk_targets = {r[2] for r in self.conn.execute("PRAGMA foreign_key_list(signals)")}
+            if signal_info.get("velocity_1h", (None, None, None, 0))[3] or "signal_observations" not in signal_fk_targets or "trend_state" not in signal_cols:
+                self.conn.execute("CREATE TABLE signals_v3 (id INTEGER PRIMARY KEY, keyword_id INTEGER NOT NULL REFERENCES keywords(id), source TEXT NOT NULL, country TEXT NOT NULL, language TEXT NOT NULL, mention_count INTEGER, unique_authors INTEGER, engagement INTEGER, velocity_1h REAL, velocity_3h REAL, velocity_6h REAL, velocity_12h REAL, velocity_24h REAL, acceleration REAL, platform_count INTEGER NOT NULL DEFAULT 1, country_count INTEGER NOT NULL DEFAULT 1, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'FIXTURE', is_fast_candidate INTEGER NOT NULL DEFAULT 0, observation_id INTEGER REFERENCES signal_observations(id), idempotency_key TEXT UNIQUE, trend_state TEXT NOT NULL DEFAULT 'NORMAL')")
+                select_trend = "trend_state" if "trend_state" in signal_cols else "'NORMAL'"
+                self.conn.execute(f"INSERT INTO signals_v3 (id,keyword_id,source,country,language,mention_count,unique_authors,engagement,velocity_1h,velocity_3h,velocity_6h,velocity_12h,velocity_24h,acceleration,platform_count,country_count,first_seen_at,last_seen_at,status,is_fast_candidate,observation_id,idempotency_key,trend_state) SELECT id,keyword_id,source,country,language,mention_count,unique_authors,engagement,velocity_1h,velocity_3h,velocity_6h,velocity_12h,velocity_24h,acceleration,platform_count,country_count,first_seen_at,last_seen_at,status,is_fast_candidate,observation_id,idempotency_key,{select_trend} FROM signals")
+                self.conn.execute("DROP TABLE signals"); self.conn.execute("ALTER TABLE signals_v3 RENAME TO signals")
+            if "input_provenance" not in self._columns("opportunities"): self._add_column("opportunities", "input_provenance", "TEXT NOT NULL DEFAULT '{}'")
+            if "risk_class" in self._columns("opportunities"): self.conn.execute("UPDATE opportunities SET risk_class='UNKNOWN' WHERE risk_class IN ('unknown','') OR risk_class IS NULL")
+            self.conn.commit(); self.conn.execute("PRAGMA foreign_keys = ON")
+            self.conn.execute("INSERT INTO schema_version(version,applied_at) VALUES(?,?)", (3, now()))
+            self.conn.execute("INSERT INTO migration_history(from_version,to_version,migration,applied_at) VALUES(?,?,?,?)", (max(version, 2), 3, "stage_1_6_followup_buckets", now()))
+            self.conn.commit()
+            if self.conn.execute("PRAGMA foreign_key_check").fetchall(): raise sqlite3.IntegrityError("foreign_key_check failed after v3 migration")
+
     def close(self):
         self.conn.close()
 
@@ -122,12 +155,21 @@ class IntelligenceDB:
 
 
 class TrendSensor:
-    def __init__(self, db): self.db = db
+    defaults = {"fast_signal_min_mentions": 10, "fast_signal_min_velocity": 10, "fast_signal_min_acceleration": 0}
+    def __init__(self, db, config=None, version="A-v2"):
+        self.db = db; self.config = dict(self.defaults); self.config.update(config or {}); self.version = version
+        self.db.conn.execute("INSERT OR IGNORE INTO harness_versions(component,version,config,created_at) VALUES(?,?,?,?)", ("TrendSensor", version, json.dumps(self.config), now())); self.db.conn.commit()
 
     def _history_velocity(self, keyword_id, observed_at, hours):
-        cutoff = (datetime.fromisoformat(observed_at) - timedelta(hours=hours)).isoformat()
-        row = self.db.conn.execute("SELECT coalesce(sum(mention_count),0) FROM signal_observations WHERE keyword_id=? AND observed_at>=? AND observed_at<=?", (keyword_id, cutoff, observed_at)).fetchone()
-        return row[0] / hours
+        bucket_start = datetime.fromisoformat(_bucket_bounds(observed_at)[0])
+        values = []
+        for offset in range(hours):
+            start = (bucket_start - timedelta(hours=offset)).isoformat()
+            rows = self.db.conn.execute("SELECT mention_count,status FROM signal_observations WHERE keyword_id=? AND bucket_start=?", (keyword_id, start)).fetchall()
+            if any(r[1] == "MISSING" or r[0] is None for r in rows): return None
+            if not rows: return None
+            values.append(sum(r[0] for r in rows))
+        return sum(values) / hours
 
     def ingest(self, keyword, source, samples=None, country="US", language="en", platform_count=1, country_count=1,
                mention_count=None, unique_authors=None, engagement=None, observed_at=None, status=None, idempotency_key=None):
@@ -147,12 +189,13 @@ class TrendSensor:
             if old: return old[0]
             obs_key = f"observation:{idempotency_key}"
         else: obs_key = None
-        self.db.conn.execute("INSERT OR IGNORE INTO signal_observations(keyword_id,source,mention_count,unique_authors,engagement,observed_at,status,idempotency_key) VALUES(?,?,?,?,?,?,?,?)", (kid, source, mention_count, unique_authors, engagement, observed_at, metric_status, obs_key))
+        bucket_start, bucket_end = _bucket_bounds(observed_at)
+        self.db.conn.execute("INSERT OR IGNORE INTO signal_observations(keyword_id,source,mention_count,unique_authors,engagement,observed_at,bucket_start,bucket_end,status,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?)", (kid, source, mention_count, unique_authors, engagement, observed_at, bucket_start, bucket_end, metric_status, obs_key))
         obs = self.db.conn.execute("SELECT id FROM signal_observations WHERE keyword_id=? AND source=? AND observed_at=? AND (idempotency_key=? OR (? IS NULL AND idempotency_key IS NULL)) ORDER BY id DESC LIMIT 1", (kid, source, observed_at, obs_key, obs_key)).fetchone()
         if velocities is None: velocities = tuple(self._history_velocity(kid, observed_at, h) for h in (1, 3, 6, 12, 24))
         v1, v3, v6, v12, v24 = velocities
-        acceleration = v1 - v3
-        fast = int(metric_status in {"OBSERVED", "FIXTURE"} and v1 >= 0 and acceleration > 0)
+        acceleration = None if None in (v1, v3) else v1 - v3
+        fast = int(metric_status in {"OBSERVED", "FIXTURE"} and v1 is not None and acceleration is not None and v1 >= self.config["fast_signal_min_mentions"] and v1 >= self.config["fast_signal_min_velocity"] and acceleration >= self.config["fast_signal_min_acceleration"])
         trend_state = "FAST_SIGNAL" if fast else "NORMAL"
         cur = self.db.conn.execute("INSERT INTO signals(keyword_id,source,country,language,mention_count,unique_authors,engagement,velocity_1h,velocity_3h,velocity_6h,velocity_12h,velocity_24h,acceleration,platform_count,country_count,first_seen_at,last_seen_at,status,is_fast_candidate,observation_id,idempotency_key,trend_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (kid, source, country, language, mention_count, unique_authors, engagement, v1, v3, v6, v12, v24, acceleration, platform_count, country_count, observed_at, observed_at, metric_status, fast, obs[0], idempotency_key, trend_state))
         self.db.conn.commit(); sid = cur.lastrowid
@@ -172,6 +215,7 @@ class Scheduler:
 
 class OpportunityEngine:
     labels = ("IGNORE", "WATCH", "FAST_WRITE", "MONEY_WRITE", "WINNER_UPDATE", "EXPERIMENT", "REVIEW_REQUIRED")
+    high_risk_classes = {"FINANCE", "HEALTH", "LAW", "POLITICS", "ACCIDENT", "RUMOR_PERSON"}
     defaults = {"velocity": .25, "search_gap": .15, "competition": -.15, "revenue": .15, "site_fit": .1, "country_fit": .1, "freshness": .15, "risk": -.2, "cost": -.05,
                 "fast_min_velocity": 20, "fast_min_acceleration": 0, "fast_min_search_gap": .3, "fast_max_risk": .7}
     def __init__(self, db, config=None, version="Opportunity-v1"):
@@ -194,17 +238,28 @@ class OpportunityEngine:
             elif any(statuses[k] not in {"REAL", "FIXTURE"} for k in values): decision = "WATCH"
             else: decision = None
             search_gap = 0 if search_gap is None else search_gap; competition = 0 if competition is None else competition; historical_revenue = 0 if historical_revenue is None else historical_revenue; site_fit = 0 if site_fit is None else site_fit; country_fit = 0 if country_fit is None else country_fit; freshness = 0 if freshness is None else freshness; risk = 0 if risk is None else risk; cost = 0 if cost is None else cost
-        c = {"velocity": min(s["velocity_1h"] / 100, 1), "search_gap": search_gap, "competition": competition, "revenue": historical_revenue, "site_fit": site_fit, "country_fit": country_fit, "freshness": freshness, "risk": risk, "cost": cost}
+        c = {"velocity": min(s["velocity_1h"] / 100, 1) if s["velocity_1h"] is not None else 0, "search_gap": search_gap, "competition": competition, "revenue": historical_revenue, "site_fit": site_fit, "country_fit": country_fit, "freshness": freshness, "risk": risk, "cost": cost}
         score = sum(self.config[k] * c[k] for k in c)
-        fast_eligible = s["velocity_1h"] >= self.config["fast_min_velocity"] and s["acceleration"] >= self.config["fast_min_acceleration"] and search_gap >= self.config["fast_min_search_gap"]
-        if not fixture and decision is not None: pass
-        elif risk > self.config["fast_max_risk"]: decision = "REVIEW_REQUIRED"
+        fast_eligible = s["velocity_1h"] is not None and s["acceleration"] is not None and s["velocity_1h"] >= self.config["fast_min_velocity"] and s["acceleration"] >= self.config["fast_min_acceleration"] and search_gap >= self.config["fast_min_search_gap"]
+        if risk > self.config["fast_max_risk"]: decision = "REVIEW_REQUIRED"
+        elif not fixture and decision is not None: pass
         elif s["status"] == "MISSING": decision = "WATCH"
         elif fast_eligible: decision = "FAST_WRITE"
         else: decision = "MONEY_WRITE" if score >= .3 else "WATCH" if score >= .05 else "IGNORE"
         strongest = max(c, key=lambda k: abs(self.config[k] * c[k]))
+        provenance_payload = {}
+        for key, value in (("search_gap", search_gap), ("competition", competition), ("history", historical_revenue), ("site_fit", site_fit), ("country_fit", country_fit), ("freshness", freshness), ("risk", risk), ("cost", cost)):
+            supplied = (provenance or {}).get(key) if isinstance(provenance, dict) else None
+            if fixture: provenance_payload[key] = {"value": value, "status": "FIXTURE", "source": "fixture", "captured_at": now()}
+            elif isinstance(supplied, dict) and supplied.get("status") == "REAL" and supplied.get("source") and supplied.get("captured_at") and supplied.get("value") == value:
+                provenance_payload[key] = supplied
+            else:
+                statuses[key] = "MISSING"; provenance_payload[key] = {"value": value, "status": "MISSING", "source": None, "captured_at": None}
+        normalized_risk_class = (risk_class or "UNKNOWN").upper()
+        if not fixture and (statuses["risk"] == "MISSING" or normalized_risk_class == "UNKNOWN" or normalized_risk_class in self.high_risk_classes): decision = "REVIEW_REQUIRED"
+        elif not fixture and any(statuses[k] == "MISSING" for k in statuses): decision = "WATCH"
         reason = f"{decision}: score={score:.3f}; fast_eligible={fast_eligible}; risk={risk}; strongest={strongest}"
-        cur = self.db.conn.execute("INSERT INTO opportunities(keyword_id,signal_id,decision,score,decision_reason,score_components,engine_version,created_at,idempotency_key,decision_mode,input_statuses,risk_class,risk_score,risk_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (s["keyword_id"], signal_id, decision, score, reason, json.dumps(c), self.version, now(), idempotency_key, decision_mode, json.dumps({**statuses, **(provenance or {})}), risk_class, risk, risk_reason))
+        cur = self.db.conn.execute("INSERT INTO opportunities(keyword_id,signal_id,decision,score,decision_reason,score_components,engine_version,created_at,idempotency_key,decision_mode,input_statuses,risk_class,risk_score,risk_reason,input_provenance) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (s["keyword_id"], signal_id, decision, score, reason, json.dumps(c), self.version, now(), idempotency_key, decision_mode, json.dumps(statuses), normalized_risk_class, risk, risk_reason, json.dumps(provenance_payload)))
         self.db.conn.commit(); oid = cur.lastrowid; self.db.add_audit("opportunity.decide", "opportunity", oid, "PASS", {"decision": decision, "reason": reason, "risk_veto": risk > self.config["fast_max_risk"]}); return oid
 
 

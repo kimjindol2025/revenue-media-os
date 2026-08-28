@@ -13,15 +13,16 @@ CREATE TABLE IF NOT EXISTS keywords (
 CREATE TABLE IF NOT EXISTS signal_observations (
   id INTEGER PRIMARY KEY, keyword_id INTEGER NOT NULL REFERENCES keywords(id),
   source TEXT NOT NULL, mention_count INTEGER, unique_authors INTEGER,
-  engagement INTEGER, observed_at TEXT NOT NULL, status TEXT NOT NULL,
+  engagement INTEGER, observed_at TEXT NOT NULL, bucket_start TEXT NOT NULL,
+  bucket_end TEXT NOT NULL, status TEXT NOT NULL,
   idempotency_key TEXT UNIQUE
 );
 CREATE TABLE IF NOT EXISTS signals (
   id INTEGER PRIMARY KEY, keyword_id INTEGER NOT NULL REFERENCES keywords(id),
   source TEXT NOT NULL, country TEXT NOT NULL, language TEXT NOT NULL,
   mention_count INTEGER, unique_authors INTEGER, engagement INTEGER,
-  velocity_1h REAL NOT NULL, velocity_3h REAL NOT NULL, velocity_6h REAL NOT NULL,
-  velocity_12h REAL NOT NULL, velocity_24h REAL NOT NULL, acceleration REAL NOT NULL,
+  velocity_1h REAL, velocity_3h REAL, velocity_6h REAL,
+  velocity_12h REAL, velocity_24h REAL, acceleration REAL,
   platform_count INTEGER NOT NULL DEFAULT 1, country_count INTEGER NOT NULL DEFAULT 1,
   first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, status TEXT NOT NULL,
   is_fast_candidate INTEGER NOT NULL DEFAULT 0, observation_id INTEGER REFERENCES signal_observations(id),
@@ -33,7 +34,7 @@ CREATE TABLE IF NOT EXISTS opportunities (
   decision_reason TEXT NOT NULL, score_components TEXT NOT NULL,
   engine_version TEXT NOT NULL, created_at TEXT NOT NULL, idempotency_key TEXT UNIQUE,
   decision_mode TEXT NOT NULL DEFAULT 'FIXTURE', input_statuses TEXT NOT NULL DEFAULT '{}',
-  risk_class TEXT NOT NULL DEFAULT 'unknown', risk_score REAL, risk_reason TEXT NOT NULL DEFAULT ''
+  risk_class TEXT NOT NULL DEFAULT 'UNKNOWN', risk_score REAL, risk_reason TEXT NOT NULL DEFAULT '', input_provenance TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS serp_snapshots (
   id INTEGER PRIMARY KEY, opportunity_id INTEGER NOT NULL REFERENCES opportunities(id),
