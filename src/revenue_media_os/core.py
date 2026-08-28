@@ -212,17 +212,23 @@ class TrendSensor:
             velocities = None
         if idempotency_key:
             old = self.db.conn.execute("SELECT id FROM signals WHERE idempotency_key=?", (idempotency_key,)).fetchone()
-            if old: return old[0]
+            old_id = old[0] if old else None
             obs_key = f"observation:{idempotency_key}"
-        else: obs_key = None
+        else:
+            old_id = None; obs_key = None
         bucket_start, bucket_end = _bucket_bounds(observed_at)
         self.db.conn.execute("INSERT OR IGNORE INTO signal_observations(keyword_id,source,mention_count,unique_authors,engagement,observed_at,bucket_start,bucket_end,captured_at,provider_request_id,raw_evidence,status,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (kid, source, mention_count, unique_authors, engagement, observed_at, bucket_start, bucket_end, captured_at or now(), provider_request_id, json.dumps(raw_evidence or {}), metric_status, obs_key))
         obs = self.db.conn.execute("SELECT id FROM signal_observations WHERE keyword_id=? AND source=? AND observed_at=? AND (idempotency_key=? OR (? IS NULL AND idempotency_key IS NULL)) ORDER BY id DESC LIMIT 1", (kid, source, observed_at, obs_key, obs_key)).fetchone()
+        if old_id:
+            self.db.conn.execute("UPDATE signal_observations SET mention_count=?,unique_authors=?,engagement=?,observed_at=?,bucket_start=?,bucket_end=?,captured_at=?,provider_request_id=?,raw_evidence=?,status=? WHERE id=?", (mention_count, unique_authors, engagement, observed_at, bucket_start, bucket_end, captured_at or now(), provider_request_id, json.dumps(raw_evidence or {}), metric_status, obs[0]))
         if velocities is None: velocities = tuple(self._history_velocity(kid, observed_at, h) for h in (1, 3, 6, 12, 24))
         v1, v3, v6, v12, v24 = velocities
         acceleration = None if None in (v1, v3) else v1 - v3
         fast = int(metric_status in {"OBSERVED", "FIXTURE"} and v1 is not None and acceleration is not None and v1 >= self.config["fast_signal_min_mentions"] and v1 >= self.config["fast_signal_min_velocity"] and acceleration >= self.config["fast_signal_min_acceleration"])
         trend_state = "FAST_SIGNAL" if fast else "NORMAL"
+        if old_id:
+            self.db.conn.execute("UPDATE signals SET mention_count=?,unique_authors=?,engagement=?,velocity_1h=?,velocity_3h=?,velocity_6h=?,velocity_12h=?,velocity_24h=?,acceleration=?,first_seen_at=?,last_seen_at=?,status=?,is_fast_candidate=?,observation_id=?,trend_state=? WHERE id=?", (mention_count, unique_authors, engagement, v1, v3, v6, v12, v24, acceleration, observed_at, observed_at, metric_status, fast, obs[0], trend_state, old_id))
+            self.db.conn.commit(); self.db.add_audit("trend.ingest", "signal", old_id, "PASS", {"metric_status": metric_status, "rolling_window": "24h", "raw_observation_id": obs[0], "refreshed": True}); return old_id
         cur = self.db.conn.execute("INSERT INTO signals(keyword_id,source,country,language,mention_count,unique_authors,engagement,velocity_1h,velocity_3h,velocity_6h,velocity_12h,velocity_24h,acceleration,platform_count,country_count,first_seen_at,last_seen_at,status,is_fast_candidate,observation_id,idempotency_key,trend_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (kid, source, country, language, mention_count, unique_authors, engagement, v1, v3, v6, v12, v24, acceleration, platform_count, country_count, observed_at, observed_at, metric_status, fast, obs[0], idempotency_key, trend_state))
         self.db.conn.commit(); sid = cur.lastrowid
         self.db.add_audit("trend.ingest", "signal", sid, "PASS", {"metric_status": metric_status, "rolling_window": "24h", "raw_observation_id": obs[0]})
@@ -240,26 +246,34 @@ class TrendSensor:
             if since_dt.tzinfo is None or until_dt.tzinfo is None: raise ValueError
         except (AttributeError, TypeError, ValueError):
             return {"provider_status": "FAIL", "signals": [], "normalized_count": 0, "error": "invalid provider window"}
-        ids = []
+        normalized = []
         for item in result.data:
             if not isinstance(item, dict):
-                return {"provider_status": "FAIL", "signals": ids, "normalized_count": len(ids), "error": "provider item must be an object"}
+                return {"provider_status": "FAIL", "signals": [], "normalized_count": 0, "error": "provider item must be an object"}
             required = ("keyword", "source", "mention_count", "unique_authors", "engagement", "observed_at", "country", "language")
             if any(field not in item for field in required) or item["country"] != country or item["language"] != language:
-                return {"provider_status": "FAIL", "signals": ids, "normalized_count": len(ids), "error": "malformed normalized provider item"}
+                return {"provider_status": "FAIL", "signals": [], "normalized_count": 0, "error": "malformed normalized provider item"}
             if item["source"] != getattr(provider, "name", item["source"]):
-                return {"provider_status": "FAIL", "signals": ids, "normalized_count": len(ids), "error": "provider source mismatch"}
+                return {"provider_status": "FAIL", "signals": [], "normalized_count": 0, "error": "provider source mismatch"}
             if not all(isinstance(item[field], (int, float)) and not isinstance(item[field], bool) and math.isfinite(item[field]) and item[field] >= 0 for field in ("mention_count", "unique_authors", "engagement")):
-                return {"provider_status": "FAIL", "signals": ids, "normalized_count": len(ids), "error": "invalid provider metric"}
+                return {"provider_status": "FAIL", "signals": [], "normalized_count": 0, "error": "invalid provider metric"}
             try:
                 stamp = datetime.fromisoformat(item["observed_at"].replace("Z", "+00:00"))
                 if stamp.tzinfo is None or stamp.utcoffset() is None or stamp > datetime.now(stamp.tzinfo): raise ValueError
             except (AttributeError, TypeError, ValueError):
-                return {"provider_status": "FAIL", "signals": ids, "normalized_count": len(ids), "error": "invalid provider observed_at"}
+                return {"provider_status": "FAIL", "signals": [], "normalized_count": 0, "error": "invalid provider observed_at"}
             captured_at = item.get("captured_at") or result.captured_at
             if not _valid_captured_at(captured_at):
-                return {"provider_status": "FAIL", "signals": ids, "normalized_count": len(ids), "error": "invalid provider captured_at"}
+                return {"provider_status": "FAIL", "signals": [], "normalized_count": 0, "error": "invalid provider captured_at"}
+            captured_dt = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+            if captured_dt > datetime.now(captured_dt.tzinfo):
+                return {"provider_status": "FAIL", "signals": [], "normalized_count": 0, "error": "provider captured_at is in the future"}
+            if stamp.astimezone(timezone.utc) >= until_dt.astimezone(timezone.utc):
+                return {"provider_status": "FAIL", "signals": [], "normalized_count": 0, "error": "provider item is outside until boundary"}
             status = "STALE" if stamp.astimezone(timezone.utc) < since_dt.astimezone(timezone.utc) else "OBSERVED"
+            normalized.append((item, status, captured_at))
+        ids = []
+        for item, status, captured_at in normalized:
             ids.append(self.ingest(item["keyword"], item["source"], country=country, language=language, mention_count=item["mention_count"], unique_authors=item["unique_authors"], engagement=item["engagement"], observed_at=item["observed_at"], status=status, idempotency_key=item.get("idempotency_key") or f"{item['source']}:{item['keyword']}:{item['observed_at']}", captured_at=captured_at, provider_request_id=item.get("provider_request_id") or result.provider_request_id, raw_evidence=item.get("raw_evidence") or {"provider": item["source"], "normalized_count": len(result.data)}))
         return {"provider_status": "PASS", "signals": ids, "normalized_count": len(ids)}
 

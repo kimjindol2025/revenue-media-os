@@ -7,15 +7,23 @@ publishing, or automated social actions.
 ## Provider contract
 
 `RedditTrendsProvider.fetch_trends(country, language, since, until)` reads
-`REDDIT_ACCESS_TOKEN` and `REDDIT_USER_AGENT` from the environment. Without an
-access token it returns `NOT_CONFIGURED`; there is no fixture fallback. A
+`REDDIT_ACCESS_TOKEN` and a required, operator-supplied unique
+`REDDIT_USER_AGENT` from the environment. Without either credential it returns
+`NOT_CONFIGURED`; there is no fixture fallback. Reddit listing data does not
+carry country or language attribution, so this adapter accepts only
+`GLOBAL/und` and returns `PARTIAL` for a narrower requested market. A
 successful response is normalized into hourly keyword aggregates and passed to
 `TrendSensor.ingest_provider()`.
 
 The normalized observation retains the raw event timestamp, UTC bucket,
 provider request fingerprint, capture timestamp, and redacted audit evidence.
-Secrets are not included in the stored evidence. Invalid, negative, NaN,
-infinite, future, or stale values are rejected or marked non-investable.
+Secrets are not included in the stored evidence. Pagination is followed until
+the listing ends; if the configured page limit is reached, the result is
+`PARTIAL` and is not persisted as complete data. Re-fetching the same provider
+keyword/hour aggregate updates that aggregate rather than freezing its first
+count. Invalid, negative, NaN, infinite, future, or stale values are rejected
+or marked non-investable, and provider batches are validated before any row is
+written.
 
 ## Status meanings
 

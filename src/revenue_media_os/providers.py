@@ -35,7 +35,9 @@ def _request(url, method="GET", payload=None, headers=None, timeout=15):
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
             return ProviderResult("PASS", json.loads(raw) if raw else {})
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as exc:
+    except urllib.error.HTTPError as exc:
+        return ProviderResult("FAIL", error="HTTP 429 rate limited" if exc.code == 429 else str(exc))
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
         return ProviderResult("FAIL", error=str(exc))
 
 
@@ -65,30 +67,43 @@ class RedditTrendsProvider:
     name = "reddit"
     _stopwords = {"about", "after", "again", "because", "could", "from", "have", "just", "more", "than", "that", "their", "there", "these", "they", "this", "what", "when", "where", "which", "with", "would", "your"}
 
-    def __init__(self, access_token=None, user_agent=None, endpoint=None, request_fn=None):
+    def __init__(self, access_token=None, user_agent=None, endpoint=None, request_fn=None, max_pages=10):
         self.access_token = access_token or os.getenv("REDDIT_ACCESS_TOKEN")
-        self.user_agent = user_agent or os.getenv("REDDIT_USER_AGENT", "revenue-media-os/2.0")
+        self.user_agent = user_agent or os.getenv("REDDIT_USER_AGENT")
         self.endpoint = (endpoint or os.getenv("REDDIT_ENDPOINT", "https://oauth.reddit.com/r/all/new.json")).rstrip("/")
-        self.request_fn = request_fn or _request
+        self.request_fn = request_fn or _request; self.max_pages = max_pages
 
     def fetch_trends(self, country, language, since, until):
-        if not self.access_token:
+        if not self.access_token or not self.user_agent:
             return ProviderResult("NOT_CONFIGURED")
+        if (country, language) != ("GLOBAL", "und"):
+            return ProviderResult("PARTIAL", error="Reddit listing has no country/language attribution; request GLOBAL/und")
         try:
             start = _parse_provider_time(since); end = _parse_provider_time(until)
         except ValueError as exc:
             return ProviderResult("FAIL", error=str(exc))
         if start >= end:
             return ProviderResult("FAIL", error="since must be before until")
-        query = urllib.parse.urlencode({"limit": 100, "raw_json": 1})
-        url = self.endpoint + ("&" if "?" in self.endpoint else "?") + query
-        result = self.request_fn(url, headers={"Authorization": f"Bearer {self.access_token}", "User-Agent": self.user_agent})
-        if result.status != "PASS":
-            return result
-        payload = result.data
-        children = payload.get("data", {}).get("children") if isinstance(payload, dict) else None
-        if not isinstance(children, list):
-            return ProviderResult("FAIL", error="malformed Reddit response")
+        children = []
+        after = None
+        request_urls = []
+        for _ in range(self.max_pages):
+            params = {"limit": 100, "raw_json": 1}
+            if after: params["after"] = after
+            query = urllib.parse.urlencode(params)
+            url = self.endpoint + ("&" if "?" in self.endpoint else "?") + query
+            request_urls.append(url)
+            result = self.request_fn(url, headers={"Authorization": f"Bearer {self.access_token}", "User-Agent": self.user_agent})
+            if result.status != "PASS": return result
+            payload = result.data
+            page = payload.get("data") if isinstance(payload, dict) else None
+            page_children = page.get("children") if isinstance(page, dict) else None
+            if not isinstance(page_children, list): return ProviderResult("FAIL", error="malformed Reddit response")
+            children.extend(page_children)
+            after = page.get("after")
+            if not after: break
+        if after:
+            return ProviderResult("PARTIAL", error="pagination limit reached before Reddit listing ended")
         groups = defaultdict(lambda: {"mentions": 0, "authors": set(), "engagement": 0, "posts": []})
         for child in children:
             post = child.get("data") if isinstance(child, dict) else None
@@ -115,7 +130,7 @@ class RedditTrendsProvider:
                 if isinstance(author, str) and author: group["authors"].add(author)
                 if len(group["posts"]) < 20: group["posts"].append({"id": post_id, "observed_at": observed.isoformat()})
         captured = datetime.now(timezone.utc).isoformat()
-        request_id = hashlib.sha256(url.encode()).hexdigest()[:24]
+        request_id = hashlib.sha256("|".join(request_urls).encode()).hexdigest()[:24]
         rows = [{"keyword": term, "source": self.name, "mention_count": g["mentions"], "unique_authors": len(g["authors"]), "engagement": g["engagement"], "observed_at": bucket, "country": country, "language": language, "provider_status": "PASS", "provider_request_id": request_id, "captured_at": captured, "raw_evidence": {"provider": self.name, "post_count": len(g["posts"]), "posts": g["posts"]}} for (term, bucket), g in sorted(groups.items())]
         return ProviderResult("CONFIGURED_NO_DATA" if not rows else "PASS", rows, provider_request_id=request_id, captured_at=captured, raw={"normalized_count": len(rows)})
 

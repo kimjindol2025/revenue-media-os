@@ -39,19 +39,22 @@ class Stage2Test(unittest.TestCase):
     def test_real_provider_not_configured(self):
         result = RedditTrendsProvider(access_token=None, endpoint="https://example.test").fetch_trends("US", "en", *self.window())
         self.assertEqual(result.status, "NOT_CONFIGURED")
+        self.assertEqual(RedditTrendsProvider(access_token="token", endpoint="https://example.test").fetch_trends("GLOBAL", "und", *self.window()).status, "NOT_CONFIGURED")
+        scoped = RedditTrendsProvider(access_token="token", user_agent="test-agent/1.0", endpoint="https://example.test").fetch_trends("US", "en", *self.window())
+        self.assertEqual(scoped.status, "PARTIAL")
 
     def test_real_provider_success_normalizes_and_persists(self):
         created = datetime.now(timezone.utc).timestamp() - 60
         payload = {"data": {"children": [{"data": {"id": "abc", "title": "OpenAI coding agent", "author": "alice", "score": 7, "num_comments": 3, "created_utc": created}}]}}
-        provider = RedditTrendsProvider(access_token="secret-token", endpoint="https://example.test", request_fn=self.reddit_request(payload))
-        result = provider.fetch_trends("US", "en", *self.window())
+        provider = RedditTrendsProvider(access_token="secret-token", user_agent="test-agent/1.0", endpoint="https://example.test", request_fn=self.reddit_request(payload))
+        result = provider.fetch_trends("GLOBAL", "und", *self.window())
         self.assertEqual(result.status, "PASS")
         self.assertTrue(result.data[0]["provider_request_id"])
         self.assertNotIn("secret-token", json.dumps(result.raw))
-        saved = TrendSensor(self.db).ingest_provider(provider, "US", "en", *self.window())
+        saved = TrendSensor(self.db).ingest_provider(provider, "GLOBAL", "und", *self.window())
         self.assertEqual(saved["provider_status"], "PASS")
         row = self.db.conn.execute("SELECT * FROM signal_observations").fetchone()
-        self.assertEqual((row["status"], row["source"], row["mention_count"]), ("OBSERVED", "reddit", 1))
+        self.assertEqual((row["status"], row["source"], row["mention_count"], row["keyword_id"] is not None), ("OBSERVED", "reddit", 1, True))
         self.assertTrue(row["bucket_start"].endswith(":00:00+00:00"))
         self.assertTrue(row["bucket_end"].endswith(":00:00+00:00"))
         self.assertEqual(row["provider_request_id"], result.data[0]["provider_request_id"])
@@ -59,14 +62,29 @@ class Stage2Test(unittest.TestCase):
 
     def test_real_provider_no_data_and_failure_states(self):
         empty = {"data": {"children": []}}
-        result = RedditTrendsProvider(access_token="token", endpoint="https://example.test", request_fn=self.reddit_request(empty)).fetch_trends("US", "en", *self.window())
+        result = RedditTrendsProvider(access_token="token", user_agent="test-agent/1.0", endpoint="https://example.test", request_fn=self.reddit_request(empty)).fetch_trends("GLOBAL", "und", *self.window())
         self.assertEqual(result.status, "CONFIGURED_NO_DATA")
-        failure = RedditTrendsProvider(access_token="token", endpoint="https://example.test", request_fn=lambda *args, **kwargs: ProviderResult("FAIL", error="upstream"))
-        self.assertEqual(failure.fetch_trends("US", "en", *self.window()).status, "FAIL")
+        failure = RedditTrendsProvider(access_token="token", user_agent="test-agent/1.0", endpoint="https://example.test", request_fn=lambda *args, **kwargs: ProviderResult("FAIL", error="upstream"))
+        self.assertEqual(failure.fetch_trends("GLOBAL", "und", *self.window()).status, "FAIL")
+
+    def test_real_provider_paginates_until_end(self):
+        created = datetime.now(timezone.utc).timestamp() - 60
+        calls = []
+        def request(url, headers=None):
+            calls.append(url)
+            post = {"id": "one" if len(calls) == 1 else "two", "title": "pagination trend", "author": "author", "score": 1, "num_comments": 1, "created_utc": created}
+            return ProviderResult("PASS", {"data": {"children": [{"data": post}], "after": "next" if len(calls) == 1 else None}})
+        provider = RedditTrendsProvider(access_token="token", user_agent="test-agent/1.0", endpoint="https://example.test", request_fn=request)
+        result = provider.fetch_trends("GLOBAL", "und", *self.window())
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result.data[0]["mention_count"], 2)
+        calls.clear()
+        limited = RedditTrendsProvider(access_token="token", user_agent="test-agent/1.0", endpoint="https://example.test", request_fn=request, max_pages=1)
+        self.assertEqual(limited.fetch_trends("GLOBAL", "und", *self.window()).status, "PARTIAL")
 
     def test_real_provider_malformed_response(self):
-        provider = RedditTrendsProvider(access_token="token", endpoint="https://example.test", request_fn=self.reddit_request({"unexpected": []}))
-        self.assertEqual(provider.fetch_trends("US", "en", *self.window()).status, "FAIL")
+        provider = RedditTrendsProvider(access_token="token", user_agent="test-agent/1.0", endpoint="https://example.test", request_fn=self.reddit_request({"unexpected": []}))
+        self.assertEqual(provider.fetch_trends("GLOBAL", "und", *self.window()).status, "FAIL")
 
     def test_real_provider_validation_rejects_bad_numeric_and_future_data(self):
         since, until = self.window()
@@ -98,10 +116,18 @@ class Stage2Test(unittest.TestCase):
         since = (datetime.fromisoformat(observed) - timedelta(hours=1)).isoformat()
         until = (datetime.fromisoformat(observed) + timedelta(hours=1)).isoformat()
         first = sensor.ingest_provider(FakeProvider(data=[item]), "US", "en", since, until)
-        second = sensor.ingest_provider(FakeProvider(data=[item]), "US", "en", since, until)
+        refreshed = dict(item, mention_count=8, engagement=9)
+        second = sensor.ingest_provider(FakeProvider(data=[refreshed]), "US", "en", since, until)
         self.assertEqual(first["signals"], second["signals"])
         self.assertEqual(self.db.conn.execute("SELECT count(*) FROM signals").fetchone()[0], 1)
-        self.assertEqual(self.db.conn.execute("SELECT status FROM signal_observations").fetchone()[0], "OBSERVED")
+        self.assertEqual(tuple(self.db.conn.execute("SELECT mention_count,status FROM signal_observations").fetchone()), (8, "OBSERVED"))
+
+    def test_real_batch_validation_is_atomic(self):
+        base = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        valid = {"keyword": "valid", "source": "reddit", "mention_count": 1, "unique_authors": 1, "engagement": 1, "observed_at": base.isoformat(), "country": "US", "language": "en", "captured_at": datetime.now(timezone.utc).isoformat()}
+        result = TrendSensor(self.db).ingest_provider(FakeProvider(data=[valid, {"keyword": "malformed"}]), "US", "en", (base - timedelta(hours=1)).isoformat(), (base + timedelta(hours=1)).isoformat())
+        self.assertEqual(result["provider_status"], "FAIL")
+        self.assertEqual(self.db.conn.execute("SELECT count(*) FROM signal_observations").fetchone()[0], 0)
 
 
 if __name__ == "__main__":
