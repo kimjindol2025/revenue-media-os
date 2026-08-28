@@ -61,12 +61,19 @@ class OpenSERPProvider:
 class WordPressPublisher:
     def __init__(self, base_url=None, token=None): self.base_url = (base_url or os.getenv("WORDPRESS_URL", "")).rstrip("/"); self.token = token or os.getenv("WORDPRESS_TOKEN")
     def _configured(self): return bool(self.base_url and self.token)
+    @staticmethod
+    def validate_post_response(result):
+        if result.status != "PASS": return result
+        data = result.data if isinstance(result.data, dict) else {}
+        if not isinstance(data.get("id"), int) or not isinstance(data.get("link"), str) or not data.get("link") or not isinstance(data.get("status"), str):
+            return ProviderResult("FAIL", error="WordPress response missing validated id/link/status")
+        return ProviderResult("PASS", {"id": data["id"], "link": data["link"], "status": data["status"]})
     def publish(self, title, body, status="draft"):
         if not self._configured(): return ProviderResult("NOT_CONFIGURED")
-        return _request(self.base_url + "/wp-json/wp/v2/posts", "POST", {"title": title, "content": body, "status": status}, {"Authorization": f"Bearer {self.token}"})
+        return self.validate_post_response(_request(self.base_url + "/wp-json/wp/v2/posts", "POST", {"title": title, "content": body, "status": status}, {"Authorization": f"Bearer {self.token}"}))
     def update(self, post_id, title, body, status="draft"):
         if not self._configured(): return ProviderResult("NOT_CONFIGURED")
-        return _request(self.base_url + f"/wp-json/wp/v2/posts/{post_id}", "POST", {"title": title, "content": body, "status": status}, {"Authorization": f"Bearer {self.token}"})
+        return self.validate_post_response(_request(self.base_url + f"/wp-json/wp/v2/posts/{post_id}", "POST", {"title": title, "content": body, "status": status}, {"Authorization": f"Bearer {self.token}"}))
     def get_status(self, post_id): return "NOT_CONFIGURED" if not self._configured() else "UNVERIFIED"
     def get_url(self, post_id): return None if not self._configured() else self.base_url + f"/?p={post_id}"
 
@@ -81,10 +88,15 @@ class GoogleAPIProvider:
 
 class PublisherRouter:
     def __init__(self, db, adapters=None): self.db=db; self.adapters=adapters or {"local": None}
-    def select_site(self, keyword, country, language, topic=None):
+    def select_site_result(self, keyword, country, language, topic=None, authority_tags=None):
         clauses=["country=?", "language=?", "health_status != 'BLOCKED'", "policy_status != 'BLOCKED'"]; args=[country,language]
         if topic: clauses.append("topic LIKE ?"); args.append("%"+topic+"%")
         row=self.db.conn.execute("SELECT * FROM sites WHERE " + " AND ".join(clauses) + " ORDER BY average_rpm DESC, average_revenue DESC LIMIT 1",args).fetchone()
-        return row
+        if not row: return None
+        topic_fit=1.0 if not topic or topic.lower() in row["topic"].lower() else .3; authority_fit=1.0 if not authority_tags else min(1.0,sum(a in row["authority_tags"] for a in authority_tags)/len(authority_tags)); historical=min(1.0,float(row["average_revenue"])/100); score=.3*topic_fit+.2*authority_fit+.2+.15+.15*historical
+        return {"site":row,"site_fit_score":score,"selection_reason":f"topic={topic_fit:.2f}; authority={authority_fit:.2f}; country=1.00; language=1.00; historical_revenue={historical:.2f}"}
+    def select_site(self, keyword, country, language, topic=None):
+        result=self.select_site_result(keyword,country,language,topic)
+        return result["site"] if result else None
     def adapter_for(self, site):
         return self.adapters.get(site["platform"]) if site else None
