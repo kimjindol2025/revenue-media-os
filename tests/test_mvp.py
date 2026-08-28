@@ -43,7 +43,16 @@ class MvpTest(unittest.TestCase):
         kid=self.db.keyword("history","US","en"); TrendSensor(self.db).ingest("history","api",mention_count=10,unique_authors=2,engagement=5,observed_at="2026-08-28T00:00:00+00:00",status="OBSERVED"); self.assertEqual(self.db.conn.execute("SELECT count(*) FROM signal_observations WHERE keyword_id=?",(kid,)).fetchone()[0],1)
 
     def test_real_velocity_1h_3h_acceleration_and_time_boundary(self):
-        sensor=TrendSensor(self.db); sensor.ingest("velocity","api",mention_count=30,unique_authors=3,engagement=30,observed_at="2026-08-28T09:00:00+00:00",status="OBSERVED"); sid=sensor.ingest("velocity","api",mention_count=10,unique_authors=1,engagement=10,observed_at="2026-08-28T10:00:00+00:00",status="OBSERVED"); s=self.db.conn.execute("SELECT velocity_1h,velocity_3h,acceleration FROM signals WHERE id=?",(sid,)).fetchone(); self.assertAlmostEqual(s["velocity_1h"],40); self.assertAlmostEqual(s["velocity_3h"],40/3); self.assertAlmostEqual(s["acceleration"],40-(40/3))
+        sensor=TrendSensor(self.db); sensor.ingest("velocity","api",mention_count=0,unique_authors=0,engagement=0,observed_at="2026-08-28T08:00:00+00:00",status="OBSERVED"); sensor.ingest("velocity","api",mention_count=30,unique_authors=3,engagement=30,observed_at="2026-08-28T09:00:00+00:00",status="OBSERVED"); sid=sensor.ingest("velocity","api",mention_count=10,unique_authors=1,engagement=10,observed_at="2026-08-28T10:00:00+00:00",status="OBSERVED"); s=self.db.conn.execute("SELECT velocity_1h,velocity_3h,acceleration FROM signals WHERE id=?",(sid,)).fetchone(); self.assertAlmostEqual(s["velocity_1h"],10); self.assertAlmostEqual(s["velocity_3h"],40/3); self.assertAlmostEqual(s["acceleration"],10-(40/3))
+
+    def test_hourly_aggregation_normalizes_provider_timestamps(self):
+        sensor=TrendSensor(self.db)
+        for stamp, count in (("2026-08-28T10:03:00+00:00", 2), ("2026-08-28T10:21:00+00:00", 3), ("2026-08-28T10:49:00+00:00", 5)):
+            sid=sensor.ingest("hourly", "api", mention_count=count, unique_authors=1, engagement=count, observed_at=stamp, status="OBSERVED")
+        row=self.db.conn.execute("SELECT velocity_1h FROM signals WHERE id=?", (sid,)).fetchone()
+        bucket=self.db.conn.execute("SELECT bucket_start,bucket_end FROM signal_observations ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual((bucket["bucket_start"], bucket["bucket_end"]), ("2026-08-28T10:00:00+00:00", "2026-08-28T11:00:00+00:00"))
+        self.assertEqual(row["velocity_1h"], 10)
 
     def test_missing_zero_separation_and_real_decision_boundary(self):
         sensor=TrendSensor(self.db); zero=sensor.ingest("zero","api",mention_count=0,unique_authors=0,engagement=0,observed_at="2026-08-28T00:00:00+00:00",status="OBSERVED"); missing=sensor.ingest("missing","api",observed_at="2026-08-28T00:00:00+00:00"); z=self.db.conn.execute("SELECT mention_count,unique_authors,engagement,status FROM signals WHERE id=?",(zero,)).fetchone(); m=self.db.conn.execute("SELECT mention_count,unique_authors,engagement,status FROM signals WHERE id=?",(missing,)).fetchone(); self.assertEqual(tuple(z),(0,0,0,"OBSERVED")); self.assertEqual(tuple(m),(None,None,None,"MISSING")); oid=OpportunityEngine(self.db).decide(zero); self.assertEqual(self.db.conn.execute("SELECT decision FROM opportunities WHERE id=?",(oid,)).fetchone()[0],"REVIEW_REQUIRED")
@@ -53,6 +62,22 @@ class MvpTest(unittest.TestCase):
 
     def test_fast_harness_config_and_risk_veto(self):
         sid=TrendSensor(self.db).ingest("fast","fixture",[50,90,120,160,200]); oid=OpportunityEngine(self.db,{"fast_min_velocity":100,"fast_max_risk":.2}).decide(sid,risk=.9,search_gap=1); row=self.db.conn.execute("SELECT decision FROM opportunities WHERE id=?",(oid,)).fetchone(); self.assertEqual(row[0],"REVIEW_REQUIRED")
+
+    def test_real_provenance_and_unknown_risk_guard(self):
+        sid=TrendSensor(self.db).ingest("provenance", "api", mention_count=20, unique_authors=4, engagement=8, observed_at="2026-08-28T00:00:00+00:00", status="OBSERVED")
+        captured="2026-08-28T00:05:00+00:00"
+        provenance={key:{"value":value,"status":"REAL","source":"test-provider","captured_at":captured} for key,value in {"search_gap":1,"competition":.1,"history":.4,"site_fit":.8,"country_fit":1,"freshness":.9,"risk":.1,"cost":.1}.items()}
+        oid=OpportunityEngine(self.db).decide(sid, search_gap=1, competition=.1, historical_revenue=.4, site_fit=.8, country_fit=1, freshness=.9, risk=.1, cost=.1, provenance=provenance, risk_class="unknown")
+        stored=json.loads(self.db.conn.execute("SELECT input_provenance FROM opportunities WHERE id=?",(oid,)).fetchone()[0])
+        self.assertEqual(stored["search_gap"], provenance["search_gap"])
+        self.assertEqual(self.db.conn.execute("SELECT decision FROM opportunities WHERE id=?",(oid,)).fetchone()[0], "REVIEW_REQUIRED")
+
+    def test_real_risk_veto_overrides_fast_score(self):
+        sid=TrendSensor(self.db).ingest("risky", "api", mention_count=30, unique_authors=5, engagement=10, observed_at="2026-08-28T00:00:00+00:00", status="OBSERVED")
+        captured="2026-08-28T00:05:00+00:00"
+        provenance={key:{"value":value,"status":"REAL","source":"test-provider","captured_at":captured} for key,value in {"search_gap":1,"competition":.1,"history":.4,"site_fit":.8,"country_fit":1,"freshness":.9,"risk":.9,"cost":.1}.items()}
+        oid=OpportunityEngine(self.db).decide(sid, search_gap=1, competition=.1, historical_revenue=.4, site_fit=.8, country_fit=1, freshness=.9, risk=.9, cost=.1, provenance=provenance, risk_class="finance")
+        self.assertEqual(self.db.conn.execute("SELECT decision FROM opportunities WHERE id=?",(oid,)).fetchone()[0], "REVIEW_REQUIRED")
 
     def test_cost_attribution(self):
         sid=TrendSensor(self.db).ingest("cost","fixture",[2,4,6,8,10]); oid=OpportunityEngine(self.db).decide(sid); Telemetry(self.db).record_cost("serp","openserp",amount=.03,opportunity_id=oid,idempotency_key="cost-1"); self.assertEqual(self.db.conn.execute("SELECT opportunity_id FROM cost_metrics WHERE idempotency_key='cost-1'").fetchone()[0],oid); self.assertEqual(content_economics(self.db,999)["contribution_profit"],0)
@@ -85,10 +110,10 @@ class MvpTest(unittest.TestCase):
         self.db.set_config("report_timezone","Asia/Seoul"); sid=TrendSensor(self.db).ingest("kst","fixture",[2,4,6,8,10]); self.db.conn.execute("UPDATE signals SET last_seen_at='2026-08-27T15:30:00+00:00' WHERE id=?",(sid,)); self.db.conn.commit(); self.assertEqual(daily_report(self.db,"2026-08-28")["signals"],1); self.db.set_config("report_timezone","America/New_York"); self.assertEqual(daily_report(self.db,"2026-08-27")["signals"],1)
 
     def test_old_db_migration_preserves_data_and_foreign_keys(self):
-        path=tempfile.mktemp(suffix=".sqlite3"); old=sqlite3.connect(path); old.executescript("CREATE TABLE keywords(id INTEGER PRIMARY KEY, keyword TEXT NOT NULL UNIQUE, country TEXT NOT NULL, language TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE signals(id INTEGER PRIMARY KEY, keyword_id INTEGER NOT NULL, source TEXT NOT NULL, country TEXT NOT NULL, language TEXT NOT NULL, mention_count INTEGER NOT NULL, unique_authors INTEGER NOT NULL, engagement INTEGER NOT NULL, velocity_1h REAL NOT NULL, velocity_3h REAL NOT NULL, velocity_6h REAL NOT NULL, velocity_12h REAL NOT NULL, velocity_24h REAL NOT NULL, acceleration REAL NOT NULL, platform_count INTEGER NOT NULL, country_count INTEGER NOT NULL, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, is_fast_candidate INTEGER NOT NULL); CREATE TABLE cost_metrics(id INTEGER PRIMARY KEY,component TEXT NOT NULL,provider TEXT NOT NULL,input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,amount REAL NOT NULL,currency TEXT NOT NULL,captured_at TEXT NOT NULL,status TEXT NOT NULL); INSERT INTO keywords VALUES(1,'GPT','US','en','2026-01-01'); INSERT INTO signals VALUES(1,1,'old','US','en',3,1,2,3,1,1,1,1,2,1,1,'2026-01-01','2026-01-01',0); INSERT INTO cost_metrics VALUES(1,'writer','local',1,2,.5,'USD','2026-01-01','PASS');"); old.commit(); old.close(); db=IntelligenceDB(path); self.assertEqual(db.keyword("GPT","KR","ko"),2); self.assertEqual(db.conn.execute("SELECT keyword,country FROM keywords WHERE id=1").fetchone()[1],"US"); self.assertEqual(db.conn.execute("SELECT amount FROM cost_metrics WHERE id=1").fetchone()[0],.5); self.assertTrue({r[2] for r in db.conn.execute("PRAGMA foreign_key_list(cost_metrics)")} >= {"opportunities","contents","publications"}); self.assertEqual(db.conn.execute("PRAGMA foreign_key_check").fetchall(),[]); db.close()
+        path=tempfile.mktemp(suffix=".sqlite3"); old=sqlite3.connect(path); old.executescript((Path(__file__).parent/"fixtures"/"stage1_schema.sql").read_text()); old.executescript("INSERT INTO keywords VALUES(1,'GPT','US','en','2026-01-01'); INSERT INTO signals VALUES(1,1,'old','US','en',3,1,2,3,1,1,1,1,2,1,1,'2026-01-01','2026-01-01',0); INSERT INTO cost_metrics VALUES(1,'writer','local',1,2,.5,'USD','2026-01-01','PASS');"); old.commit(); old.close(); db=IntelligenceDB(path); self.assertEqual(db.keyword("GPT","KR","ko"),2); self.assertEqual(db.conn.execute("SELECT keyword,country FROM keywords WHERE id=1").fetchone()[1],"US"); self.assertEqual(db.conn.execute("SELECT amount FROM cost_metrics WHERE id=1").fetchone()[0],.5); self.assertTrue({r[2] for r in db.conn.execute("PRAGMA foreign_key_list(cost_metrics)")} >= {"opportunities","contents","publications"}); self.assertEqual(db.conn.execute("PRAGMA foreign_key_check").fetchall(),[]); db.close()
 
     def test_schema_versioning(self):
-        self.assertEqual(self.db.conn.execute("SELECT max(version) FROM schema_version").fetchone()[0],2); self.assertGreaterEqual(self.db.conn.execute("SELECT count(*) FROM migration_history").fetchone()[0],1)
+        self.assertEqual(self.db.conn.execute("SELECT max(version) FROM schema_version").fetchone()[0],3); self.assertGreaterEqual(self.db.conn.execute("SELECT count(*) FROM migration_history").fetchone()[0],1)
 
     def test_idempotency_boundary(self):
         s=Scheduler(TrendSensor(self.db)); a=s.run_once([{"keyword":"same","source":"api","mention_count":3,"unique_authors":1,"engagement":2,"observed_at":"2026-08-28T00:00:00+00:00","status":"OBSERVED","idempotency_key":"event-1"}],run_id="r1"); b=s.run_once([{"keyword":"same","source":"api","mention_count":3,"unique_authors":1,"engagement":2,"observed_at":"2026-08-28T00:00:00+00:00","status":"OBSERVED","idempotency_key":"event-1"}],run_id="r2"); self.assertEqual(a["signals"],b["signals"]); self.assertEqual(self.db.conn.execute("SELECT count(*) FROM signals").fetchone()[0],1)
