@@ -5,11 +5,15 @@ and endpoints must be supplied by the operator; otherwise the result is
 NOT_CONFIGURED and no database PASS is emitted.
 """
 import json
+import hashlib
 import os
+import re
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from collections import defaultdict
 
 
 @dataclass
@@ -17,6 +21,9 @@ class ProviderResult:
     status: str
     data: object = None
     error: str = None
+    provider_request_id: str = None
+    captured_at: str = None
+    raw: object = None
 
 
 def _request(url, method="GET", payload=None, headers=None, timeout=15):
@@ -45,6 +52,89 @@ class RSSFeedSource:
             return ProviderResult("PASS", data)
         except (urllib.error.URLError, ET.ParseError, TimeoutError) as exc:
             return ProviderResult("FAIL", error=str(exc))
+
+
+class RedditTrendsProvider:
+    """Authenticated Reddit listing adapter with no fixture fallback.
+
+    Reddit does not expose a single universal trend-count endpoint. This
+    adapter derives hourly keyword aggregates from recent post titles while
+    retaining the source post ids/timestamps as audit evidence. Credentials
+    are read only from the environment and never returned in raw evidence.
+    """
+    name = "reddit"
+    _stopwords = {"about", "after", "again", "because", "could", "from", "have", "just", "more", "than", "that", "their", "there", "these", "they", "this", "what", "when", "where", "which", "with", "would", "your"}
+
+    def __init__(self, access_token=None, user_agent=None, endpoint=None, request_fn=None):
+        self.access_token = access_token or os.getenv("REDDIT_ACCESS_TOKEN")
+        self.user_agent = user_agent or os.getenv("REDDIT_USER_AGENT", "revenue-media-os/2.0")
+        self.endpoint = (endpoint or os.getenv("REDDIT_ENDPOINT", "https://oauth.reddit.com/r/all/new.json")).rstrip("/")
+        self.request_fn = request_fn or _request
+
+    def fetch_trends(self, country, language, since, until):
+        if not self.access_token:
+            return ProviderResult("NOT_CONFIGURED")
+        try:
+            start = _parse_provider_time(since); end = _parse_provider_time(until)
+        except ValueError as exc:
+            return ProviderResult("FAIL", error=str(exc))
+        if start >= end:
+            return ProviderResult("FAIL", error="since must be before until")
+        query = urllib.parse.urlencode({"limit": 100, "raw_json": 1})
+        url = self.endpoint + ("&" if "?" in self.endpoint else "?") + query
+        result = self.request_fn(url, headers={"Authorization": f"Bearer {self.access_token}", "User-Agent": self.user_agent})
+        if result.status != "PASS":
+            return result
+        payload = result.data
+        children = payload.get("data", {}).get("children") if isinstance(payload, dict) else None
+        if not isinstance(children, list):
+            return ProviderResult("FAIL", error="malformed Reddit response")
+        groups = defaultdict(lambda: {"mentions": 0, "authors": set(), "engagement": 0, "posts": []})
+        for child in children:
+            post = child.get("data") if isinstance(child, dict) else None
+            if not isinstance(post, dict):
+                return ProviderResult("FAIL", error="malformed Reddit post")
+            created = post.get("created_utc")
+            if not isinstance(created, (int, float)) or not _finite_nonnegative(created):
+                return ProviderResult("FAIL", error="invalid Reddit timestamp")
+            observed = datetime.fromtimestamp(created, timezone.utc)
+            if observed < start or observed >= end or observed > datetime.now(timezone.utc):
+                continue
+            title = post.get("title")
+            if not isinstance(title, str):
+                return ProviderResult("FAIL", error="malformed Reddit title")
+            author = post.get("author")
+            score = post.get("score", 0); comments = post.get("num_comments", 0)
+            if not _finite_nonnegative(score) or not _finite_nonnegative(comments):
+                return ProviderResult("FAIL", error="invalid Reddit metric")
+            bucket = observed.replace(minute=0, second=0, microsecond=0).isoformat()
+            post_id = post.get("id")
+            for term in self._terms(title):
+                group = groups[(term, bucket)]
+                group["mentions"] += 1; group["engagement"] += int(score) + int(comments)
+                if isinstance(author, str) and author: group["authors"].add(author)
+                if len(group["posts"]) < 20: group["posts"].append({"id": post_id, "observed_at": observed.isoformat()})
+        captured = datetime.now(timezone.utc).isoformat()
+        request_id = hashlib.sha256(url.encode()).hexdigest()[:24]
+        rows = [{"keyword": term, "source": self.name, "mention_count": g["mentions"], "unique_authors": len(g["authors"]), "engagement": g["engagement"], "observed_at": bucket, "country": country, "language": language, "provider_status": "PASS", "provider_request_id": request_id, "captured_at": captured, "raw_evidence": {"provider": self.name, "post_count": len(g["posts"]), "posts": g["posts"]}} for (term, bucket), g in sorted(groups.items())]
+        return ProviderResult("CONFIGURED_NO_DATA" if not rows else "PASS", rows, provider_request_id=request_id, captured_at=captured, raw={"normalized_count": len(rows)})
+
+    def _terms(self, title):
+        return {term.lower() for term in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", title) if term.lower() not in self._stopwords}
+
+
+def _parse_provider_time(value):
+    if not isinstance(value, str): raise ValueError("timestamp must be ISO-8601")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None: raise ValueError("timestamp must include timezone offset")
+    return parsed.astimezone(timezone.utc)
+
+
+def _finite_nonnegative(value):
+    try:
+        return float(value) >= 0 and float(value) != float("inf") and float(value) == float(value)
+    except (TypeError, ValueError):
+        return False
 
 
 class OpenSERPProvider:

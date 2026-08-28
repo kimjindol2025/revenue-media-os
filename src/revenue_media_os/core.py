@@ -6,7 +6,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from .providers import PublisherRouter
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 UTC = timezone.utc
 
 
@@ -141,6 +141,13 @@ class IntelligenceDB:
             self.conn.commit()
             if self.conn.execute("PRAGMA foreign_key_check").fetchall(): raise sqlite3.IntegrityError("foreign_key_check failed after v3 migration")
 
+        if version < 4:
+            for name, definition in (("captured_at", "TEXT NOT NULL DEFAULT ''"), ("provider_request_id", "TEXT"), ("raw_evidence", "TEXT NOT NULL DEFAULT '{}'")):
+                self._add_column("signal_observations", name, definition)
+            self.conn.execute("INSERT INTO schema_version(version,applied_at) VALUES(?,?)", (4, now()))
+            self.conn.execute("INSERT INTO migration_history(from_version,to_version,migration,applied_at) VALUES(?,?,?,?)", (max(version, 3), 4, "stage_2_0_provider_evidence", now()))
+            self.conn.commit()
+
     def close(self):
         self.conn.close()
 
@@ -190,7 +197,8 @@ class TrendSensor:
         return sum(values) / hours
 
     def ingest(self, keyword, source, samples=None, country="US", language="en", platform_count=1, country_count=1,
-               mention_count=None, unique_authors=None, engagement=None, observed_at=None, status=None, idempotency_key=None):
+               mention_count=None, unique_authors=None, engagement=None, observed_at=None, status=None, idempotency_key=None,
+               captured_at=None, provider_request_id=None, raw_evidence=None):
         kid = self.db.keyword(keyword, country, language)
         observed_at = observed_at or now()
         if samples is not None:
@@ -208,7 +216,7 @@ class TrendSensor:
             obs_key = f"observation:{idempotency_key}"
         else: obs_key = None
         bucket_start, bucket_end = _bucket_bounds(observed_at)
-        self.db.conn.execute("INSERT OR IGNORE INTO signal_observations(keyword_id,source,mention_count,unique_authors,engagement,observed_at,bucket_start,bucket_end,status,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?)", (kid, source, mention_count, unique_authors, engagement, observed_at, bucket_start, bucket_end, metric_status, obs_key))
+        self.db.conn.execute("INSERT OR IGNORE INTO signal_observations(keyword_id,source,mention_count,unique_authors,engagement,observed_at,bucket_start,bucket_end,captured_at,provider_request_id,raw_evidence,status,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (kid, source, mention_count, unique_authors, engagement, observed_at, bucket_start, bucket_end, captured_at or now(), provider_request_id, json.dumps(raw_evidence or {}), metric_status, obs_key))
         obs = self.db.conn.execute("SELECT id FROM signal_observations WHERE keyword_id=? AND source=? AND observed_at=? AND (idempotency_key=? OR (? IS NULL AND idempotency_key IS NULL)) ORDER BY id DESC LIMIT 1", (kid, source, observed_at, obs_key, obs_key)).fetchone()
         if velocities is None: velocities = tuple(self._history_velocity(kid, observed_at, h) for h in (1, 3, 6, 12, 24))
         v1, v3, v6, v12, v24 = velocities
@@ -219,6 +227,41 @@ class TrendSensor:
         self.db.conn.commit(); sid = cur.lastrowid
         self.db.add_audit("trend.ingest", "signal", sid, "PASS", {"metric_status": metric_status, "rolling_window": "24h", "raw_observation_id": obs[0]})
         return sid
+
+    def ingest_provider(self, provider, country, language, since, until):
+        result = provider.fetch_trends(country, language, since, until)
+        if result.status != "PASS":
+            return {"provider_status": result.status, "signals": [], "normalized_count": 0, "error": result.error}
+        if not isinstance(result.data, list):
+            return {"provider_status": "FAIL", "signals": [], "normalized_count": 0, "error": "provider data must be a list"}
+        try:
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            until_dt = datetime.fromisoformat(until.replace("Z", "+00:00"))
+            if since_dt.tzinfo is None or until_dt.tzinfo is None: raise ValueError
+        except (AttributeError, TypeError, ValueError):
+            return {"provider_status": "FAIL", "signals": [], "normalized_count": 0, "error": "invalid provider window"}
+        ids = []
+        for item in result.data:
+            if not isinstance(item, dict):
+                return {"provider_status": "FAIL", "signals": ids, "normalized_count": len(ids), "error": "provider item must be an object"}
+            required = ("keyword", "source", "mention_count", "unique_authors", "engagement", "observed_at", "country", "language")
+            if any(field not in item for field in required) or item["country"] != country or item["language"] != language:
+                return {"provider_status": "FAIL", "signals": ids, "normalized_count": len(ids), "error": "malformed normalized provider item"}
+            if item["source"] != getattr(provider, "name", item["source"]):
+                return {"provider_status": "FAIL", "signals": ids, "normalized_count": len(ids), "error": "provider source mismatch"}
+            if not all(isinstance(item[field], (int, float)) and not isinstance(item[field], bool) and math.isfinite(item[field]) and item[field] >= 0 for field in ("mention_count", "unique_authors", "engagement")):
+                return {"provider_status": "FAIL", "signals": ids, "normalized_count": len(ids), "error": "invalid provider metric"}
+            try:
+                stamp = datetime.fromisoformat(item["observed_at"].replace("Z", "+00:00"))
+                if stamp.tzinfo is None or stamp.utcoffset() is None or stamp > datetime.now(stamp.tzinfo): raise ValueError
+            except (AttributeError, TypeError, ValueError):
+                return {"provider_status": "FAIL", "signals": ids, "normalized_count": len(ids), "error": "invalid provider observed_at"}
+            captured_at = item.get("captured_at") or result.captured_at
+            if not _valid_captured_at(captured_at):
+                return {"provider_status": "FAIL", "signals": ids, "normalized_count": len(ids), "error": "invalid provider captured_at"}
+            status = "STALE" if stamp.astimezone(timezone.utc) < since_dt.astimezone(timezone.utc) else "OBSERVED"
+            ids.append(self.ingest(item["keyword"], item["source"], country=country, language=language, mention_count=item["mention_count"], unique_authors=item["unique_authors"], engagement=item["engagement"], observed_at=item["observed_at"], status=status, idempotency_key=item.get("idempotency_key") or f"{item['source']}:{item['keyword']}:{item['observed_at']}", captured_at=captured_at, provider_request_id=item.get("provider_request_id") or result.provider_request_id, raw_evidence=item.get("raw_evidence") or {"provider": item["source"], "normalized_count": len(result.data)}))
+        return {"provider_status": "PASS", "signals": ids, "normalized_count": len(ids)}
 
 
 class Scheduler:

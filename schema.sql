@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS signal_observations (
   id INTEGER PRIMARY KEY, keyword_id INTEGER NOT NULL REFERENCES keywords(id),
   source TEXT NOT NULL, mention_count INTEGER, unique_authors INTEGER,
   engagement INTEGER, observed_at TEXT NOT NULL, bucket_start TEXT NOT NULL,
-  bucket_end TEXT NOT NULL, status TEXT NOT NULL,
+  bucket_end TEXT NOT NULL, captured_at TEXT NOT NULL DEFAULT '',
+  provider_request_id TEXT, raw_evidence TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL,
   idempotency_key TEXT UNIQUE
 );
 CREATE TABLE IF NOT EXISTS signals (
