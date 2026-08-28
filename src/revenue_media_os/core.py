@@ -1,4 +1,5 @@
 import json
+import math
 import sqlite3
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,23 @@ def _bucket_bounds(observed_at):
     moment = datetime.fromisoformat(observed_at)
     start = moment.replace(minute=0, second=0, microsecond=0)
     return start.isoformat(), (start + timedelta(hours=1)).isoformat()
+
+
+def _provenance_value_matches(expected, actual):
+    try:
+        return math.isclose(float(expected), float(actual), rel_tol=1e-9, abs_tol=1e-9)
+    except (TypeError, ValueError):
+        return expected == actual
+
+
+def _valid_captured_at(value):
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
 
 
 class IntelligenceDB:
@@ -251,7 +269,9 @@ class OpportunityEngine:
         for key, value in (("search_gap", search_gap), ("competition", competition), ("history", historical_revenue), ("site_fit", site_fit), ("country_fit", country_fit), ("freshness", freshness), ("risk", risk), ("cost", cost)):
             supplied = (provenance or {}).get(key) if isinstance(provenance, dict) else None
             if fixture: provenance_payload[key] = {"value": value, "status": "FIXTURE", "source": "fixture", "captured_at": now()}
-            elif isinstance(supplied, dict) and supplied.get("status") == "REAL" and supplied.get("source") and supplied.get("captured_at") and supplied.get("value") == value:
+            elif (isinstance(supplied, dict) and supplied.get("status") == "REAL" and supplied.get("source")
+                  and _valid_captured_at(supplied.get("captured_at"))
+                  and _provenance_value_matches(value, supplied.get("value"))):
                 provenance_payload[key] = supplied
             else:
                 statuses[key] = "MISSING"; provenance_payload[key] = {"value": value, "status": "MISSING", "source": None, "captured_at": None}
