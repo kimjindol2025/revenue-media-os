@@ -92,6 +92,17 @@ class MvpTest(unittest.TestCase):
         self.assertEqual(stored["search_gap"]["status"], "MISSING")
         self.assertEqual(self.db.conn.execute("SELECT decision FROM opportunities WHERE id=?",(oid,)).fetchone()[0], "WATCH")
 
+    def test_provenance_timestamp_requires_offset_aware_iso8601_and_tolerates_float_noise(self):
+        sid=TrendSensor(self.db).ingest("timestamp", "api", mention_count=20, unique_authors=4, engagement=8, observed_at="2026-08-28T00:00:00+00:00", status="OBSERVED")
+        values={"search_gap":.2,"competition":.1,"history":.4,"site_fit":.8,"country_fit":1,"freshness":.9,"risk":.1,"cost":.1}
+        provenance={key:{"value":value + (1e-10 if key == "search_gap" else 0),"status":"REAL","source":"test-provider","captured_at":"2026-08-28T00:05:00+09:00"} for key,value in values.items()}
+        oid=OpportunityEngine(self.db).decide(sid, search_gap=.2, competition=.1, historical_revenue=.4, site_fit=.8, country_fit=1, freshness=.9, risk=.1, cost=.1, provenance=provenance, risk_class="general")
+        self.assertEqual(self.db.conn.execute("SELECT decision FROM opportunities WHERE id=?",(oid,)).fetchone()[0], "MONEY_WRITE")
+        provenance["search_gap"]["captured_at"]="2026-08-28T00:05:00"
+        oid=OpportunityEngine(self.db).decide(sid, search_gap=.2, competition=.1, historical_revenue=.4, site_fit=.8, country_fit=1, freshness=.9, risk=.1, cost=.1, provenance=provenance, risk_class="general", idempotency_key="invalid-captured-at")
+        stored=json.loads(self.db.conn.execute("SELECT input_provenance FROM opportunities WHERE id=?",(oid,)).fetchone()[0])
+        self.assertEqual(stored["search_gap"]["status"], "MISSING")
+
     def test_cost_attribution(self):
         sid=TrendSensor(self.db).ingest("cost","fixture",[2,4,6,8,10]); oid=OpportunityEngine(self.db).decide(sid); Telemetry(self.db).record_cost("serp","openserp",amount=.03,opportunity_id=oid,idempotency_key="cost-1"); self.assertEqual(self.db.conn.execute("SELECT opportunity_id FROM cost_metrics WHERE idempotency_key='cost-1'").fetchone()[0],oid); self.assertEqual(content_economics(self.db,999)["contribution_profit"],0)
 
