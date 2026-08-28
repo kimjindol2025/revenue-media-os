@@ -16,14 +16,17 @@ successful response is normalized into hourly keyword aggregates and passed to
 `TrendSensor.ingest_provider()`.
 
 The normalized observation retains the raw event timestamp, UTC bucket,
-provider request fingerprint, capture timestamp, and redacted audit evidence.
+provider request fingerprint, unique fetch evidence id, capture timestamp, and
+redacted audit evidence.
 Secrets are not included in the stored evidence. Pagination is followed until
 the listing ends; if the configured page limit is reached, the result is
 `PARTIAL` and is not persisted as complete data. Re-fetching the same provider
 keyword/hour aggregate updates that aggregate rather than freezing its first
 count. Invalid, negative, NaN, infinite, future, or stale values are rejected
 or marked non-investable, and provider batches are validated before any row is
-written.
+written. Persisting a validated batch is one database transaction; a storage
+failure rolls the entire batch back. Pagination stops once the oldest fetched
+post reaches the requested `since` boundary.
 
 ## Status meanings
 

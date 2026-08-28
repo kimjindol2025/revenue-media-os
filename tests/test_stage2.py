@@ -1,5 +1,6 @@
 import json
 import math
+import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -81,6 +82,15 @@ class Stage2Test(unittest.TestCase):
         calls.clear()
         limited = RedditTrendsProvider(access_token="token", user_agent="test-agent/1.0", endpoint="https://example.test", request_fn=request, max_pages=1)
         self.assertEqual(limited.fetch_trends("GLOBAL", "und", *self.window()).status, "PARTIAL")
+        since, until = self.window()
+        calls.clear()
+        def boundary_request(url, headers=None):
+            calls.append(url)
+            post = {"id": "boundary", "title": "boundary trend", "author": "author", "score": 1, "num_comments": 1, "created_utc": datetime.fromisoformat(since).timestamp()}
+            return ProviderResult("PASS", {"data": {"children": [{"data": post}], "after": "should-not-be-requested"}})
+        boundary = RedditTrendsProvider(access_token="token", user_agent="test-agent/1.0", endpoint="https://example.test", request_fn=boundary_request)
+        self.assertEqual(boundary.fetch_trends("GLOBAL", "und", since, until).status, "PASS")
+        self.assertEqual(len(calls), 1)
 
     def test_real_provider_malformed_response(self):
         provider = RedditTrendsProvider(access_token="token", user_agent="test-agent/1.0", endpoint="https://example.test", request_fn=self.reddit_request({"unexpected": []}))
@@ -96,6 +106,8 @@ class Stage2Test(unittest.TestCase):
             self.assertEqual(result["provider_status"], "FAIL")
         future = dict(base, mention_count=1, observed_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
         self.assertEqual(TrendSensor(self.db).ingest_provider(FakeProvider(data=[future]), "US", "en", since, until)["provider_status"], "FAIL")
+        future_capture = dict(base, mention_count=1, observed_at=since, captured_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+        self.assertEqual(TrendSensor(self.db).ingest_provider(FakeProvider(data=[future_capture]), "US", "en", since, until)["provider_status"], "FAIL")
 
     def test_real_hourly_aggregation_and_fast_signal(self):
         sensor = TrendSensor(self.db, {"fast_signal_min_mentions": 10, "fast_signal_min_velocity": 0, "fast_signal_min_acceleration": 0})
@@ -121,6 +133,22 @@ class Stage2Test(unittest.TestCase):
         self.assertEqual(first["signals"], second["signals"])
         self.assertEqual(self.db.conn.execute("SELECT count(*) FROM signals").fetchone()[0], 1)
         self.assertEqual(tuple(self.db.conn.execute("SELECT mention_count,status FROM signal_observations").fetchone()), (8, "OBSERVED"))
+
+    def test_real_batch_database_failure_rolls_back_all_rows(self):
+        class FailingSensor(TrendSensor):
+            def __init__(self, db):
+                super().__init__(db)
+                self.calls = 0
+            def ingest(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 2:
+                    raise sqlite3.IntegrityError("simulated storage failure")
+                return super().ingest(*args, **kwargs)
+        base = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        rows = [{"keyword": f"row-{n}", "source": "reddit", "mention_count": 1, "unique_authors": 1, "engagement": 1, "observed_at": (base + timedelta(minutes=n)).isoformat(), "country": "US", "language": "en", "captured_at": datetime.now(timezone.utc).isoformat()} for n in (0, 1)]
+        result = FailingSensor(self.db).ingest_provider(FakeProvider(data=rows), "US", "en", base.isoformat(), (base + timedelta(hours=1)).isoformat())
+        self.assertEqual(result["provider_status"], "FAIL")
+        self.assertEqual(self.db.conn.execute("SELECT count(*) FROM signal_observations").fetchone()[0], 0)
 
     def test_real_batch_validation_is_atomic(self):
         base = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)

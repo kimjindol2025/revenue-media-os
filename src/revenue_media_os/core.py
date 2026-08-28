@@ -198,7 +198,7 @@ class TrendSensor:
 
     def ingest(self, keyword, source, samples=None, country="US", language="en", platform_count=1, country_count=1,
                mention_count=None, unique_authors=None, engagement=None, observed_at=None, status=None, idempotency_key=None,
-               captured_at=None, provider_request_id=None, raw_evidence=None):
+               captured_at=None, provider_request_id=None, raw_evidence=None, commit=True, audit=True):
         kid = self.db.keyword(keyword, country, language)
         observed_at = observed_at or now()
         if samples is not None:
@@ -228,10 +228,13 @@ class TrendSensor:
         trend_state = "FAST_SIGNAL" if fast else "NORMAL"
         if old_id:
             self.db.conn.execute("UPDATE signals SET mention_count=?,unique_authors=?,engagement=?,velocity_1h=?,velocity_3h=?,velocity_6h=?,velocity_12h=?,velocity_24h=?,acceleration=?,first_seen_at=?,last_seen_at=?,status=?,is_fast_candidate=?,observation_id=?,trend_state=? WHERE id=?", (mention_count, unique_authors, engagement, v1, v3, v6, v12, v24, acceleration, observed_at, observed_at, metric_status, fast, obs[0], trend_state, old_id))
-            self.db.conn.commit(); self.db.add_audit("trend.ingest", "signal", old_id, "PASS", {"metric_status": metric_status, "rolling_window": "24h", "raw_observation_id": obs[0], "refreshed": True}); return old_id
+            if commit: self.db.conn.commit()
+            if audit: self.db.add_audit("trend.ingest", "signal", old_id, "PASS", {"metric_status": metric_status, "rolling_window": "24h", "raw_observation_id": obs[0], "refreshed": True})
+            return old_id
         cur = self.db.conn.execute("INSERT INTO signals(keyword_id,source,country,language,mention_count,unique_authors,engagement,velocity_1h,velocity_3h,velocity_6h,velocity_12h,velocity_24h,acceleration,platform_count,country_count,first_seen_at,last_seen_at,status,is_fast_candidate,observation_id,idempotency_key,trend_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (kid, source, country, language, mention_count, unique_authors, engagement, v1, v3, v6, v12, v24, acceleration, platform_count, country_count, observed_at, observed_at, metric_status, fast, obs[0], idempotency_key, trend_state))
-        self.db.conn.commit(); sid = cur.lastrowid
-        self.db.add_audit("trend.ingest", "signal", sid, "PASS", {"metric_status": metric_status, "rolling_window": "24h", "raw_observation_id": obs[0]})
+        if commit: self.db.conn.commit()
+        sid = cur.lastrowid
+        if audit: self.db.add_audit("trend.ingest", "signal", sid, "PASS", {"metric_status": metric_status, "rolling_window": "24h", "raw_observation_id": obs[0]})
         return sid
 
     def ingest_provider(self, provider, country, language, since, until):
@@ -273,8 +276,15 @@ class TrendSensor:
             status = "STALE" if stamp.astimezone(timezone.utc) < since_dt.astimezone(timezone.utc) else "OBSERVED"
             normalized.append((item, status, captured_at))
         ids = []
-        for item, status, captured_at in normalized:
-            ids.append(self.ingest(item["keyword"], item["source"], country=country, language=language, mention_count=item["mention_count"], unique_authors=item["unique_authors"], engagement=item["engagement"], observed_at=item["observed_at"], status=status, idempotency_key=item.get("idempotency_key") or f"{item['source']}:{item['keyword']}:{item['observed_at']}", captured_at=captured_at, provider_request_id=item.get("provider_request_id") or result.provider_request_id, raw_evidence=item.get("raw_evidence") or {"provider": item["source"], "normalized_count": len(result.data)}))
+        try:
+            self.db.conn.execute("BEGIN")
+            for item, status, captured_at in normalized:
+                ids.append(self.ingest(item["keyword"], item["source"], country=country, language=language, mention_count=item["mention_count"], unique_authors=item["unique_authors"], engagement=item["engagement"], observed_at=item["observed_at"], status=status, idempotency_key=item.get("idempotency_key") or f"{item['source']}:{item['keyword']}:{item['observed_at']}", captured_at=captured_at, provider_request_id=item.get("provider_request_id") or result.provider_request_id, raw_evidence={"provider_fetch_id": result.provider_fetch_id, **(item.get("raw_evidence") or {"provider": item["source"], "normalized_count": len(result.data)})}, commit=False, audit=False))
+            self.db.conn.commit()
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            self.db.conn.rollback()
+            return {"provider_status": "FAIL", "signals": [], "normalized_count": 0, "error": str(exc)}
+        for sid in ids: self.db.add_audit("trend.ingest", "signal", sid, "PASS", {"metric_status": "OBSERVED", "provider_fetch_id": result.provider_fetch_id})
         return {"provider_status": "PASS", "signals": ids, "normalized_count": len(ids)}
 
 

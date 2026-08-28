@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections import defaultdict
+from uuid import uuid4
 
 
 @dataclass
@@ -22,6 +23,7 @@ class ProviderResult:
     data: object = None
     error: str = None
     provider_request_id: str = None
+    provider_fetch_id: str = None
     captured_at: str = None
     raw: object = None
 
@@ -74,6 +76,7 @@ class RedditTrendsProvider:
         self.request_fn = request_fn or _request; self.max_pages = max_pages
 
     def fetch_trends(self, country, language, since, until):
+        fetch_id = uuid4().hex
         if not self.access_token or not self.user_agent:
             return ProviderResult("NOT_CONFIGURED")
         if (country, language) != ("GLOBAL", "und"):
@@ -87,6 +90,7 @@ class RedditTrendsProvider:
         children = []
         after = None
         request_urls = []
+        covered = False
         for _ in range(self.max_pages):
             params = {"limit": 100, "raw_json": 1}
             if after: params["after"] = after
@@ -100,10 +104,22 @@ class RedditTrendsProvider:
             page_children = page.get("children") if isinstance(page, dict) else None
             if not isinstance(page_children, list): return ProviderResult("FAIL", error="malformed Reddit response")
             children.extend(page_children)
+            timestamps = []
+            for child in page_children:
+                post = child.get("data") if isinstance(child, dict) else None
+                created = post.get("created_utc") if isinstance(post, dict) else None
+                if not isinstance(created, (int, float)) or not _finite_nonnegative(created):
+                    return ProviderResult("FAIL", error="invalid Reddit timestamp")
+                timestamps.append(datetime.fromtimestamp(created, timezone.utc))
+            if timestamps and min(timestamps) <= start:
+                covered = True
+                break
             after = page.get("after")
-            if not after: break
-        if after:
-            return ProviderResult("PARTIAL", error="pagination limit reached before Reddit listing ended")
+            if not after:
+                covered = True
+                break
+        if not covered:
+            return ProviderResult("PARTIAL", error="pagination limit reached before Reddit since boundary")
         groups = defaultdict(lambda: {"mentions": 0, "authors": set(), "engagement": 0, "posts": []})
         for child in children:
             post = child.get("data") if isinstance(child, dict) else None
@@ -132,7 +148,7 @@ class RedditTrendsProvider:
         captured = datetime.now(timezone.utc).isoformat()
         request_id = hashlib.sha256("|".join(request_urls).encode()).hexdigest()[:24]
         rows = [{"keyword": term, "source": self.name, "mention_count": g["mentions"], "unique_authors": len(g["authors"]), "engagement": g["engagement"], "observed_at": bucket, "country": country, "language": language, "provider_status": "PASS", "provider_request_id": request_id, "captured_at": captured, "raw_evidence": {"provider": self.name, "post_count": len(g["posts"]), "posts": g["posts"]}} for (term, bucket), g in sorted(groups.items())]
-        return ProviderResult("CONFIGURED_NO_DATA" if not rows else "PASS", rows, provider_request_id=request_id, captured_at=captured, raw={"normalized_count": len(rows)})
+        return ProviderResult("CONFIGURED_NO_DATA" if not rows else "PASS", rows, provider_request_id=request_id, provider_fetch_id=fetch_id, captured_at=captured, raw={"normalized_count": len(rows), "provider_fetch_id": fetch_id})
 
     def _terms(self, title):
         return {term.lower() for term in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", title) if term.lower() not in self._stopwords}
