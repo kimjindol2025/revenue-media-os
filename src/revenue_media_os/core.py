@@ -62,7 +62,19 @@ class LocalPublisher:
     def __init__(self,db): self.db=db
     def publish(self, content_id, site_id, output_dir):
         c=self.db.conn.execute("SELECT title,body FROM contents WHERE id=?",(content_id,)).fetchone(); Path(output_dir).mkdir(parents=True,exist_ok=True); slug=f"content-{content_id}.html"; path=(Path(output_dir)/slug).resolve(); path.write_text(f"<html><head><title>{c['title']}</title></head><body><h1>{c['title']}</h1><p>{c['body']}</p></body></html>")
-        site=self.db.conn.execute("SELECT platform FROM sites WHERE id=?",(site_id,)).fetchone(); cur=self.db.conn.execute("INSERT INTO publications(content_id,site_id,platform,external_id,url,status,published_at) VALUES(?,?,?,?,?,?,?)",(content_id,site_id,site[0],slug,path.as_uri(),"PUBLISHED",now())); self.db.conn.commit(); pid=cur.lastrowid; self.db.add_audit("publisher.publish","publication",pid,"PASS",{"adapter":"local","url":path.as_uri()}); return pid
+        site=self.db.conn.execute("SELECT platform FROM sites WHERE id=?",(site_id,)).fetchone(); cur=self.db.conn.execute("INSERT INTO publications(content_id,site_id,platform,external_id,url,status,published_at) VALUES(?,?,?,?,?,?,?)",(content_id,site_id,site[0],str(path),path.as_uri(),"PUBLISHED",now())); self.db.conn.commit(); pid=cur.lastrowid; self.db.add_audit("publisher.publish","publication",pid,"PASS",{"adapter":"local","url":path.as_uri()}); return pid
+    def update(self, publication_id, title, body):
+        p=self.db.conn.execute("SELECT external_id FROM publications WHERE id=?",(publication_id,)).fetchone(); path=Path(p[0]); path.write_text(f"<html><head><title>{title}</title></head><body><h1>{title}</h1><p>{body}</p></body></html>"); self.db.conn.execute("UPDATE publications SET status='UPDATED' WHERE id=?",(publication_id,)); self.db.conn.commit(); return self.get_url(publication_id)
+    def get_status(self, publication_id): return self.db.conn.execute("SELECT status FROM publications WHERE id=?",(publication_id,)).fetchone()[0]
+    def get_url(self, publication_id): return self.db.conn.execute("SELECT url FROM publications WHERE id=?",(publication_id,)).fetchone()[0]
+
+class NotConfiguredPublisher:
+    """Safe placeholder for real platforms; never pretends to have published."""
+    def __init__(self, platform): self.platform=platform
+    def publish(self, *args, **kwargs): return {"status":"NOT_CONFIGURED","platform":self.platform}
+    def update(self, *args, **kwargs): return {"status":"NOT_CONFIGURED","platform":self.platform}
+    def get_status(self, *args, **kwargs): return "NOT_CONFIGURED"
+    def get_url(self, *args, **kwargs): return None
 
 class Telemetry:
     def __init__(self,db): self.db=db
