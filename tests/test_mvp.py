@@ -46,13 +46,16 @@ class MvpTest(unittest.TestCase):
         sensor=TrendSensor(self.db); sensor.ingest("velocity","api",mention_count=0,unique_authors=0,engagement=0,observed_at="2026-08-28T08:00:00+00:00",status="OBSERVED"); sensor.ingest("velocity","api",mention_count=30,unique_authors=3,engagement=30,observed_at="2026-08-28T09:00:00+00:00",status="OBSERVED"); sid=sensor.ingest("velocity","api",mention_count=10,unique_authors=1,engagement=10,observed_at="2026-08-28T10:00:00+00:00",status="OBSERVED"); s=self.db.conn.execute("SELECT velocity_1h,velocity_3h,acceleration FROM signals WHERE id=?",(sid,)).fetchone(); self.assertAlmostEqual(s["velocity_1h"],10); self.assertAlmostEqual(s["velocity_3h"],40/3); self.assertAlmostEqual(s["acceleration"],10-(40/3))
 
     def test_hourly_aggregation_normalizes_provider_timestamps(self):
-        sensor=TrendSensor(self.db)
+        sensor=TrendSensor(self.db, {"fast_signal_min_mentions":10, "fast_signal_min_velocity":0, "fast_signal_min_acceleration":0})
+        sensor.ingest("hourly", "api", mention_count=0, unique_authors=0, engagement=0, observed_at="2026-08-28T08:00:00+00:00", status="OBSERVED")
+        sensor.ingest("hourly", "api", mention_count=0, unique_authors=0, engagement=0, observed_at="2026-08-28T09:00:00+00:00", status="OBSERVED")
         for stamp, count in (("2026-08-28T10:03:00+00:00", 2), ("2026-08-28T10:21:00+00:00", 3), ("2026-08-28T10:49:00+00:00", 5)):
             sid=sensor.ingest("hourly", "api", mention_count=count, unique_authors=1, engagement=count, observed_at=stamp, status="OBSERVED")
         row=self.db.conn.execute("SELECT velocity_1h FROM signals WHERE id=?", (sid,)).fetchone()
         bucket=self.db.conn.execute("SELECT bucket_start,bucket_end FROM signal_observations ORDER BY id DESC LIMIT 1").fetchone()
         self.assertEqual((bucket["bucket_start"], bucket["bucket_end"]), ("2026-08-28T10:00:00+00:00", "2026-08-28T11:00:00+00:00"))
         self.assertEqual(row["velocity_1h"], 10)
+        self.assertEqual(self.db.conn.execute("SELECT trend_state FROM signals WHERE id=?", (sid,)).fetchone()[0], "FAST_SIGNAL")
 
     def test_missing_zero_separation_and_real_decision_boundary(self):
         sensor=TrendSensor(self.db); zero=sensor.ingest("zero","api",mention_count=0,unique_authors=0,engagement=0,observed_at="2026-08-28T00:00:00+00:00",status="OBSERVED"); missing=sensor.ingest("missing","api",observed_at="2026-08-28T00:00:00+00:00"); z=self.db.conn.execute("SELECT mention_count,unique_authors,engagement,status FROM signals WHERE id=?",(zero,)).fetchone(); m=self.db.conn.execute("SELECT mention_count,unique_authors,engagement,status FROM signals WHERE id=?",(missing,)).fetchone(); self.assertEqual(tuple(z),(0,0,0,"OBSERVED")); self.assertEqual(tuple(m),(None,None,None,"MISSING")); oid=OpportunityEngine(self.db).decide(zero); self.assertEqual(self.db.conn.execute("SELECT decision FROM opportunities WHERE id=?",(oid,)).fetchone()[0],"REVIEW_REQUIRED")
@@ -78,6 +81,16 @@ class MvpTest(unittest.TestCase):
         provenance={key:{"value":value,"status":"REAL","source":"test-provider","captured_at":captured} for key,value in {"search_gap":1,"competition":.1,"history":.4,"site_fit":.8,"country_fit":1,"freshness":.9,"risk":.9,"cost":.1}.items()}
         oid=OpportunityEngine(self.db).decide(sid, search_gap=1, competition=.1, historical_revenue=.4, site_fit=.8, country_fit=1, freshness=.9, risk=.9, cost=.1, provenance=provenance, risk_class="finance")
         self.assertEqual(self.db.conn.execute("SELECT decision FROM opportunities WHERE id=?",(oid,)).fetchone()[0], "REVIEW_REQUIRED")
+
+    def test_provenance_value_mismatch_blocks_real_decision(self):
+        sid=TrendSensor(self.db).ingest("bad provenance", "api", mention_count=20, unique_authors=4, engagement=8, observed_at="2026-08-28T00:00:00+00:00", status="OBSERVED")
+        captured="2026-08-28T00:05:00+00:00"
+        provenance={key:{"value":value,"status":"REAL","source":"test-provider","captured_at":captured} for key,value in {"search_gap":.2,"competition":.1,"history":.4,"site_fit":.8,"country_fit":1,"freshness":.9,"risk":.1,"cost":.1}.items()}
+        provenance["search_gap"]["value"]=.9
+        oid=OpportunityEngine(self.db).decide(sid, search_gap=.2, competition=.1, historical_revenue=.4, site_fit=.8, country_fit=1, freshness=.9, risk=.1, cost=.1, provenance=provenance, risk_class="general")
+        stored=json.loads(self.db.conn.execute("SELECT input_provenance,input_statuses FROM opportunities WHERE id=?",(oid,)).fetchone()[0])
+        self.assertEqual(stored["search_gap"]["status"], "MISSING")
+        self.assertEqual(self.db.conn.execute("SELECT decision FROM opportunities WHERE id=?",(oid,)).fetchone()[0], "WATCH")
 
     def test_cost_attribution(self):
         sid=TrendSensor(self.db).ingest("cost","fixture",[2,4,6,8,10]); oid=OpportunityEngine(self.db).decide(sid); Telemetry(self.db).record_cost("serp","openserp",amount=.03,opportunity_id=oid,idempotency_key="cost-1"); self.assertEqual(self.db.conn.execute("SELECT opportunity_id FROM cost_metrics WHERE idempotency_key='cost-1'").fetchone()[0],oid); self.assertEqual(content_economics(self.db,999)["contribution_profit"],0)

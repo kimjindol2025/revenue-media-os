@@ -195,7 +195,7 @@ class TrendSensor:
         if velocities is None: velocities = tuple(self._history_velocity(kid, observed_at, h) for h in (1, 3, 6, 12, 24))
         v1, v3, v6, v12, v24 = velocities
         acceleration = None if None in (v1, v3) else v1 - v3
-        fast = int(metric_status in {"OBSERVED", "FIXTURE"} and mention_count is not None and v1 is not None and acceleration is not None and mention_count >= self.config["fast_signal_min_mentions"] and v1 >= self.config["fast_signal_min_velocity"] and acceleration >= self.config["fast_signal_min_acceleration"])
+        fast = int(metric_status in {"OBSERVED", "FIXTURE"} and v1 is not None and acceleration is not None and v1 >= self.config["fast_signal_min_mentions"] and v1 >= self.config["fast_signal_min_velocity"] and acceleration >= self.config["fast_signal_min_acceleration"])
         trend_state = "FAST_SIGNAL" if fast else "NORMAL"
         cur = self.db.conn.execute("INSERT INTO signals(keyword_id,source,country,language,mention_count,unique_authors,engagement,velocity_1h,velocity_3h,velocity_6h,velocity_12h,velocity_24h,acceleration,platform_count,country_count,first_seen_at,last_seen_at,status,is_fast_candidate,observation_id,idempotency_key,trend_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (kid, source, country, language, mention_count, unique_authors, engagement, v1, v3, v6, v12, v24, acceleration, platform_count, country_count, observed_at, observed_at, metric_status, fast, obs[0], idempotency_key, trend_state))
         self.db.conn.commit(); sid = cur.lastrowid
@@ -215,6 +215,7 @@ class Scheduler:
 
 class OpportunityEngine:
     labels = ("IGNORE", "WATCH", "FAST_WRITE", "MONEY_WRITE", "WINNER_UPDATE", "EXPERIMENT", "REVIEW_REQUIRED")
+    high_risk_classes = {"FINANCE", "HEALTH", "LAW", "POLITICS", "ACCIDENT", "RUMOR_PERSON"}
     defaults = {"velocity": .25, "search_gap": .15, "competition": -.15, "revenue": .15, "site_fit": .1, "country_fit": .1, "freshness": .15, "risk": -.2, "cost": -.05,
                 "fast_min_velocity": 20, "fast_min_acceleration": 0, "fast_min_search_gap": .3, "fast_max_risk": .7}
     def __init__(self, db, config=None, version="Opportunity-v1"):
@@ -250,12 +251,12 @@ class OpportunityEngine:
         for key, value in (("search_gap", search_gap), ("competition", competition), ("history", historical_revenue), ("site_fit", site_fit), ("country_fit", country_fit), ("freshness", freshness), ("risk", risk), ("cost", cost)):
             supplied = (provenance or {}).get(key) if isinstance(provenance, dict) else None
             if fixture: provenance_payload[key] = {"value": value, "status": "FIXTURE", "source": "fixture", "captured_at": now()}
-            elif isinstance(supplied, dict) and all(field in supplied for field in ("value", "status", "source", "captured_at")):
+            elif isinstance(supplied, dict) and supplied.get("status") == "REAL" and supplied.get("source") and supplied.get("captured_at") and supplied.get("value") == value:
                 provenance_payload[key] = supplied
             else:
                 statuses[key] = "MISSING"; provenance_payload[key] = {"value": value, "status": "MISSING", "source": None, "captured_at": None}
         normalized_risk_class = (risk_class or "UNKNOWN").upper()
-        if not fixture and (statuses["risk"] == "MISSING" or normalized_risk_class == "UNKNOWN"): decision = "REVIEW_REQUIRED"
+        if not fixture and (statuses["risk"] == "MISSING" or normalized_risk_class == "UNKNOWN" or normalized_risk_class in self.high_risk_classes): decision = "REVIEW_REQUIRED"
         elif not fixture and any(statuses[k] == "MISSING" for k in statuses): decision = "WATCH"
         reason = f"{decision}: score={score:.3f}; fast_eligible={fast_eligible}; risk={risk}; strongest={strongest}"
         cur = self.db.conn.execute("INSERT INTO opportunities(keyword_id,signal_id,decision,score,decision_reason,score_components,engine_version,created_at,idempotency_key,decision_mode,input_statuses,risk_class,risk_score,risk_reason,input_provenance) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (s["keyword_id"], signal_id, decision, score, reason, json.dumps(c), self.version, now(), idempotency_key, decision_mode, json.dumps(statuses), normalized_risk_class, risk, risk_reason, json.dumps(provenance_payload)))
