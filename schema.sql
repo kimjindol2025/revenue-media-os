@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   id INTEGER PRIMARY KEY, action TEXT NOT NULL, entity_type TEXT NOT NULL,
   entity_id INTEGER, status TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS cost_metrics (
+  id INTEGER PRIMARY KEY, component TEXT NOT NULL, provider TEXT NOT NULL,
+  input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+  amount REAL NOT NULL DEFAULT 0, currency TEXT NOT NULL DEFAULT 'USD',
+  captured_at TEXT NOT NULL, status TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_signals_last_seen ON signals(last_seen_at);
 CREATE INDEX IF NOT EXISTS idx_rank_pub_time ON rank_history(publication_id, captured_at);
 CREATE INDEX IF NOT EXISTS idx_revenue_pub_time ON revenue_metrics(publication_id, captured_at);

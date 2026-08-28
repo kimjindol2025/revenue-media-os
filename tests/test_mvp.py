@@ -17,4 +17,9 @@ class MvpTest(unittest.TestCase):
         sid=TrendSensor(self.db).ingest("slow","fixture",[1,3,6,12,24]); oid=OpportunityEngine(self.db,{"velocity":1,"search_gap":0,"competition":0,"revenue":0,"site_fit":0,"country_fit":0,"freshness":0,"risk":0,"cost":0}).decide(sid); self.assertIn(self.db.conn.execute("SELECT decision FROM opportunities WHERE id=?",(oid,)).fetchone()[0],("WATCH","IGNORE")); self.assertEqual(daily_report(self.db)["external_telemetry"],"NOT_CONFIGURED")
         self.assertEqual(NotConfiguredPublisher("wordpress").get_status(),"NOT_CONFIGURED")
 
+    def test_hourly_scheduler_and_cost_are_persisted(self):
+        result=Scheduler(TrendSensor(self.db)).run_once([{"keyword":"scheduled","source":"fixture","samples":[2,5,8,12,20]}]); self.assertEqual(result["interval"],"1h"); self.assertEqual(len(result["signals"]),1)
+        Telemetry(self.db).record_cost("article","local",amount=0.12,input_tokens=10,output_tokens=20,status="PASS")
+        self.assertEqual(daily_report(self.db)["ai_cost"],0.12)
+
 if __name__ == "__main__": unittest.main()

@@ -1,4 +1,4 @@
-import json, sqlite3
+import json, sqlite3, time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,6 +34,13 @@ class TrendSensor:
         kid=self.db.keyword(keyword,country,language)
         cur=self.db.conn.execute("INSERT INTO signals(keyword_id,source,country,language,mention_count,unique_authors,engagement,velocity_1h,velocity_3h,velocity_6h,velocity_12h,velocity_24h,acceleration,platform_count,country_count,first_seen_at,last_seen_at,is_fast_candidate) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(kid,source,country,language,m1,max(1,m1//2),m1*10,v1,v3,v6,v12,v24,acceleration,platform_count,country_count,now(),now(),int(fast)))
         self.db.conn.commit(); sid=cur.lastrowid; self.db.add_audit("trend.ingest","signal",sid,"PASS",{"rolling_window":"24h","fast_candidate":fast}); return sid
+
+class Scheduler:
+    """Scheduling boundary. A process supervisor/cron invokes run_once safely."""
+    def __init__(self, sensor): self.sensor=sensor
+    def run_once(self, records):
+        ids=[self.sensor.ingest(**record) for record in records]
+        return {"status":"PASS","interval":"1h","signals":ids}
 
 class OpportunityEngine:
     labels=("IGNORE","WATCH","FAST_WRITE","MONEY_WRITE","WINNER_UPDATE","EXPERIMENT")
@@ -80,8 +87,12 @@ class Telemetry:
     def __init__(self,db): self.db=db
     def record(self, publication_id, keyword_id, rank=None, traffic=None, revenue=None, provider_status="NOT_CONFIGURED"):
         t=now(); self.db.conn.execute("INSERT INTO rank_history(publication_id,keyword_id,rank,captured_at,provider_status) VALUES(?,?,?,?,?)",(publication_id,keyword_id,rank,t,provider_status)); traffic=traffic or {}; self.db.conn.execute("INSERT INTO traffic_metrics(publication_id,captured_at,impression,click,ctr,google_traffic,naver_traffic,sns_traffic,direct_traffic,engagement_time,page_views,provider_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(publication_id,t,*[traffic.get(k) for k in ('impression','click','ctr','google_traffic','naver_traffic','sns_traffic','direct_traffic','engagement_time','page_views')],provider_status)); revenue=revenue or {}; self.db.conn.execute("INSERT INTO revenue_metrics(publication_id,captured_at,adsense_revenue,adpost_revenue,rpm,provider_status) VALUES(?,?,?,?,?,?)",(publication_id,t,revenue.get('adsense_revenue'),revenue.get('adpost_revenue'),revenue.get('rpm'),provider_status)); self.db.conn.commit(); self.db.add_audit("telemetry.record","publication",publication_id,provider_status,{"rank":rank});
+    def record_cost(self, component, provider, amount=0, input_tokens=0, output_tokens=0, status="NOT_CONFIGURED"):
+        self.db.conn.execute("INSERT INTO cost_metrics(component,provider,input_tokens,output_tokens,amount,currency,captured_at,status) VALUES(?,?,?,?,?,?,?,?)",(component,provider,input_tokens,output_tokens,amount,"USD",now(),status)); self.db.conn.commit(); self.db.add_audit("cost.record","cost_metric",None,status,{"component":component,"amount":amount})
 
 def daily_report(db):
     def count(table): return db.conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
     revenue=db.conn.execute("SELECT coalesce(sum(adsense_revenue),0)+coalesce(sum(adpost_revenue),0) FROM revenue_metrics").fetchone()[0]
-    return {"signals":count("signals"),"opportunities":count("opportunities"),"contents":count("contents"),"publications":count("publications"),"fast_candidates":db.conn.execute("SELECT count(*) FROM signals WHERE is_fast_candidate=1").fetchone()[0],"revenue":revenue,"external_telemetry":"NOT_CONFIGURED","errors":db.conn.execute("SELECT count(*) FROM audit_logs WHERE status='FAIL'").fetchone()[0]}
+    traffic=db.conn.execute("SELECT coalesce(sum(click),0) FROM traffic_metrics").fetchone()[0]
+    cost=db.conn.execute("SELECT coalesce(sum(amount),0) FROM cost_metrics").fetchone()[0]
+    return {"signals":count("signals"),"trend_candidates":count("opportunities"),"opportunities":count("opportunities"),"contents":count("contents"),"publications":count("publications"),"fast_candidates":db.conn.execute("SELECT count(*) FROM signals WHERE is_fast_candidate=1").fetchone()[0],"rank_changes":"NOT_CONFIGURED","traffic_clicks":traffic,"revenue":revenue,"ai_cost":cost,"external_telemetry":"NOT_CONFIGURED","errors":db.conn.execute("SELECT count(*) FROM audit_logs WHERE status='FAIL'").fetchone()[0]}
