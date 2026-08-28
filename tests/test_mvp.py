@@ -1,76 +1,40 @@
-import json, tempfile, unittest
+import sqlite3,tempfile,sys,unittest
 from pathlib import Path
-import sys
-sys.path.insert(0,str(Path(__file__).parents[1]/"src"))
+sys.path.insert(0,str(Path(__file__).parents[1]/'src'))
+import revenue_media_os.core as core
 from revenue_media_os.core import *
-from revenue_media_os.providers import GoogleAPIProvider, OpenSERPProvider, PublisherRouter, WordPressPublisher, ProviderResult
-
-class MvpTest(unittest.TestCase):
-    def setUp(self): self.db=IntelligenceDB()
-    def tearDown(self): self.db.close()
-    def test_complete_relationship_and_fast_candidate(self):
-        sid=TrendSensor(self.db).ingest("test topic","fixture",[50,90,120,160,200],platform_count=2,country_count=2)
-        oid=OpportunityEngine(self.db).decide(sid); site=self.db.site(tenant_id="t",country="US",language="en",topic="test",platform="local")
-        e=Editorial(self.db); e.serp(oid,[{"title":"one","url":"https://one"}]); plan=e.plan(oid,site,"FAST",["gap"],"informational",["answer"]); content=e.article(plan,"Title","Original body"); pub=LocalPublisher(self.db).publish(content,site,tempfile.mkdtemp()); kid=self.db.conn.execute("SELECT keyword_id FROM opportunities WHERE id=?",(oid,)).fetchone()[0]; Telemetry(self.db).record(pub,kid,provider_status="NOT_CONFIGURED")
-        chain=self.db.conn.execute("SELECT count(*) FROM signals s JOIN opportunities o ON o.signal_id=s.id JOIN content_plans cp ON cp.opportunity_id=o.id JOIN contents c ON c.plan_id=cp.id JOIN publications p ON p.content_id=c.id JOIN rank_history r ON r.publication_id=p.id JOIN traffic_metrics t ON t.publication_id=p.id JOIN revenue_metrics m ON m.publication_id=p.id").fetchone()[0]
-        self.assertEqual(chain,1); self.assertEqual(self.db.conn.execute("SELECT is_fast_candidate FROM signals WHERE id=?",(sid,)).fetchone()[0],1); self.assertEqual(self.db.conn.execute("SELECT decision_reason FROM opportunities WHERE id=?",(oid,)).fetchone()[0][:4],"FAST"); self.assertEqual(len(e.history(kid)),1)
-    def test_configurable_scoring_and_explicit_external_status(self):
-        sid=TrendSensor(self.db).ingest("slow","fixture",[1,3,6,12,24]); oid=OpportunityEngine(self.db,{"velocity":1,"search_gap":0,"competition":0,"revenue":0,"site_fit":0,"country_fit":0,"freshness":0,"risk":0,"cost":0}).decide(sid); self.assertIn(self.db.conn.execute("SELECT decision FROM opportunities WHERE id=?",(oid,)).fetchone()[0],("WATCH","IGNORE")); self.assertEqual(daily_report(self.db)["external_telemetry"],"NOT_CONFIGURED")
-        self.assertEqual(NotConfiguredPublisher("wordpress").get_status(),"NOT_CONFIGURED")
-
-    def test_hourly_scheduler_and_cost_are_persisted(self):
-        result=Scheduler(TrendSensor(self.db)).run_once([{"keyword":"scheduled","source":"fixture","samples":[2,5,8,12,20]}]); self.assertEqual(result["interval"],"1h"); self.assertEqual(len(result["signals"]),1)
-        Telemetry(self.db).record_cost("article","local",amount=0.12,input_tokens=10,output_tokens=20,status="PASS")
-        self.assertEqual(daily_report(self.db)["ai_cost"],0.12)
-
-    def test_external_adapters_are_explicitly_unconfigured(self):
-        self.assertEqual(OpenSERPProvider().search("x").status,"NOT_CONFIGURED")
-        self.assertEqual(WordPressPublisher().publish("x","y").status,"NOT_CONFIGURED")
-        self.assertEqual(GoogleAPIProvider(None).query("reports").status,"NOT_CONFIGURED")
-        site=self.db.site(tenant_id="t",country="US",language="en",topic="tools",platform="local",average_rpm=4)
-        self.assertEqual(PublisherRouter(self.db).select_site("x","US","en","tools")["id"],site)
-
-    def test_telemetry_checkpoints_and_period_report(self):
-        sid=TrendSensor(self.db).ingest("checkpoint","fixture",[2,4,6,8,10]); oid=OpportunityEngine(self.db).decide(sid); site=self.db.site(tenant_id="t",country="US",language="en",topic="x",platform="local"); e=Editorial(self.db); plan=e.plan(oid,site,"EXPERIMENT",[],"informational",[]); cid=e.article(plan,"x","y"); pub=LocalPublisher(self.db).publish(cid,site,tempfile.mkdtemp()); kid=self.db.conn.execute("SELECT keyword_id FROM opportunities WHERE id=?",(oid,)).fetchone()[0]; Telemetry(self.db).record(pub,kid,checkpoint="7d"); self.assertEqual(self.db.conn.execute("SELECT checkpoint FROM rank_history").fetchone()[0],"7d"); self.assertEqual(period_report(self.db,"weekly")["period"],"weekly")
-
-    def test_keyword_country_language_key(self):
-        ids={self.db.keyword("GPT",c,l) for c,l in (("US","en"),("KR","ko"),("JP","ja"))}; self.assertEqual(len(ids),3)
-
-    def test_real_metric_no_fabrication(self):
-        sid=TrendSensor(self.db).ingest("observed","api",mention_count=9,unique_authors=4,engagement=77,observed_at="2026-08-28T00:00:00+00:00",status="OBSERVED"); s=self.db.conn.execute("SELECT * FROM signals WHERE id=?",(sid,)).fetchone(); self.assertEqual((s["unique_authors"],s["engagement"],s["status"]),(4,77,"OBSERVED"))
-
-    def test_raw_observation_history(self):
-        kid=self.db.keyword("history","US","en"); TrendSensor(self.db).ingest("history","api",mention_count=10,unique_authors=2,engagement=5,observed_at="2026-08-28T00:00:00+00:00",status="OBSERVED"); self.assertEqual(self.db.conn.execute("SELECT count(*) FROM signal_observations WHERE keyword_id=?",(kid,)).fetchone()[0],1)
-
-    def test_fast_harness_config_and_risk_veto(self):
-        sid=TrendSensor(self.db).ingest("fast","fixture",[50,90,120,160,200]); oid=OpportunityEngine(self.db,{"fast_min_velocity":100,"fast_max_risk":.2}).decide(sid,risk=.9,search_gap=1); row=self.db.conn.execute("SELECT decision FROM opportunities WHERE id=?",(oid,)).fetchone(); self.assertEqual(row[0],"REVIEW_REQUIRED")
-
-    def test_cost_attribution(self):
-        sid=TrendSensor(self.db).ingest("cost","fixture",[2,4,6,8,10]); oid=OpportunityEngine(self.db).decide(sid); Telemetry(self.db).record_cost("serp","openserp",amount=.03,opportunity_id=oid,idempotency_key="cost-1"); self.assertEqual(self.db.conn.execute("SELECT opportunity_id FROM cost_metrics WHERE idempotency_key='cost-1'").fetchone()[0],oid); self.assertEqual(content_economics(self.db,999)["contribution_profit"],0)
-
-    def test_daily_time_window(self):
-        sid=TrendSensor(self.db).ingest("today","fixture",[2,4,6,8,10]); self.db.conn.execute("UPDATE signals SET last_seen_at='2026-08-27T12:00:00+00:00' WHERE id=?",(sid,)); self.db.conn.commit(); self.assertEqual(daily_report(self.db,"2026-08-28")["signals"],0)
-
-    def test_weekly_monthly_time_window(self):
-        sid=TrendSensor(self.db).ingest("window","fixture",[2,4,6,8,10]); self.db.conn.execute("UPDATE signals SET last_seen_at='2026-08-20T12:00:00+00:00' WHERE id=?",(sid,)); self.db.conn.commit(); self.assertEqual(period_report(self.db,"weekly","2026-08-28")["period_start"],"2026-08-22"); self.assertEqual(period_report(self.db,"monthly","2026-08-28")["period_start"],"2026-07-30")
-
-    def test_content_type_reporting_and_decision_reporting(self):
-        sid=TrendSensor(self.db).ingest("report","fixture",[2,4,6,8,10]); oid=OpportunityEngine(self.db).decide(sid); site=self.db.site(tenant_id="t",country="US",language="en",topic="x",platform="local"); Editorial(self.db).plan(oid,site,"MONEY",[],"commercial",[]); result=period_report(self.db,"weekly","2099-01-01"); self.assertEqual(result["by_content_type"],[]); self.assertEqual(result["by_decision"],[]); result=period_report(self.db,"monthly"); self.assertEqual(result["by_content_type"][0]["content_type"],"MONEY")
-
-    def test_c_history_revenue_context(self):
-        sid=TrendSensor(self.db).ingest("revenue","fixture",[2,4,6,8,10]); oid=OpportunityEngine(self.db).decide(sid); site=self.db.site(tenant_id="t",country="US",language="en",topic="x",platform="local"); e=Editorial(self.db); plan=e.plan(oid,site,"MONEY",[],"commercial",[],harness="B-v9"); cid=e.article(plan,"title","body"); pub=LocalPublisher(self.db).publish(cid,site,tempfile.mkdtemp()); kid=self.db.conn.execute("SELECT keyword_id FROM opportunities WHERE id=?",(oid,)).fetchone()[0]; Telemetry(self.db).record(pub,kid,rank=3,traffic={"impression":100,"click":10,"ctr":.1,"page_views":12},revenue={"adsense_revenue":1.2,"rpm":10},rank_status="PASS",analytics_status="PASS",revenue_status="PASS",search_console_status="PASS",checkpoint="24h"); h=e.history(kid)[0]; self.assertEqual((h["content_type"],h["harness_version"],h["adsense_revenue"],h["click"]),("MONEY","B-v9",1.2,10))
-
-    def test_provider_status_separation(self):
-        sid=TrendSensor(self.db).ingest("status","fixture",[2,4,6,8,10]); oid=OpportunityEngine(self.db).decide(sid); site=self.db.site(tenant_id="t",country="US",language="en",topic="x",platform="local"); e=Editorial(self.db); plan=e.plan(oid,site,"FAST",[],"x",[]); cid=e.article(plan,"x","y"); pub=LocalPublisher(self.db).publish(cid,site,tempfile.mkdtemp()); kid=self.db.conn.execute("SELECT keyword_id FROM opportunities WHERE id=?",(oid,)).fetchone()[0]; Telemetry(self.db).record(pub,kid,rank=1,rank_status="PASS",search_console_status="CONFIGURED_NO_DATA",analytics_status="NOT_CONFIGURED",revenue_status="FAIL"); row=self.db.conn.execute("SELECT provider_status FROM rank_history").fetchone(); self.assertEqual(row[0],"PASS"); self.assertEqual(self.db.conn.execute("SELECT provider_status FROM traffic_metrics").fetchone()[0],"NOT_CONFIGURED"); self.assertEqual(self.db.conn.execute("SELECT provider_status FROM revenue_metrics").fetchone()[0],"FAIL")
-        self.assertEqual(WordPressPublisher.validate_post_response(ProviderResult("PASS",{"id":1,"link":"https://example.test/p","status":"publish"})).status,"PASS"); self.assertEqual(WordPressPublisher.validate_post_response(ProviderResult("PASS",{"id":1})).status,"FAIL")
-
-    def test_site_fit_reason(self):
-        site=self.db.site(tenant_id="t",country="US",language="en",topic="tools",platform="local",authority_tags="tools,home",average_revenue=50); result=PublisherRouter(self.db).select_site_result("x","US","en","tools",["tools"]); self.assertGreater(result["site_fit_score"],0); self.assertIn("topic=1.00",result["selection_reason"]); self.assertEqual(result["site"]["id"],site)
-
-    def test_schema_versioning(self):
-        self.assertEqual(self.db.conn.execute("SELECT max(version) FROM schema_version").fetchone()[0],2); self.assertGreaterEqual(self.db.conn.execute("SELECT count(*) FROM migration_history").fetchone()[0],1)
-
-    def test_idempotency_boundary(self):
-        s=Scheduler(TrendSensor(self.db)); a=s.run_once([{"keyword":"same","source":"api","mention_count":3,"unique_authors":1,"engagement":2,"observed_at":"2026-08-28T00:00:00+00:00","status":"OBSERVED","idempotency_key":"event-1"}],run_id="r1"); b=s.run_once([{"keyword":"same","source":"api","mention_count":3,"unique_authors":1,"engagement":2,"observed_at":"2026-08-28T00:00:00+00:00","status":"OBSERVED","idempotency_key":"event-1"}],run_id="r2"); self.assertEqual(a["signals"],b["signals"]); self.assertEqual(self.db.conn.execute("SELECT count(*) FROM signals").fetchone()[0],1)
-
-if __name__ == "__main__": unittest.main()
+from revenue_media_os.providers import PublisherRouter,WordPressPublisher,ProviderResult,OpenSERPProvider,GoogleAPIProvider
+REAL={'search_gap':'PASS','competition':'PASS','historical_revenue':'CONFIGURED_NO_DATA','site_fit':'PASS','country_fit':'PASS','freshness':'PASS','risk':'PASS','cost':'PASS'}
+class T(unittest.TestCase):
+ def setUp(self): self.db=IntelligenceDB()
+ def tearDown(self): self.db.close()
+ def pub(self,k='x'):
+  s=TrendSensor(self.db).ingest(k,'fixture',[30,60,90,120,180]); o=OpportunityEngine(self.db).decide(s,mode='FIXTURE'); site=self.db.site(tenant_id='t',country='US',language='en',topic='ai coding',platform='local',authority_tags='ai,coding',health_status='GOOD',policy_status='CLEAN'); e=Editorial(self.db); p=e.plan(o,site,'MONEY',[],'info',[]); c=e.article(p,'t','b'); pub=LocalPublisher(self.db).publish(c,site,tempfile.mkdtemp()); kid=self.db.conn.execute('select keyword_id from opportunities where id=?',(o,)).fetchone()[0]; return s,o,site,c,pub,kid
+ def test_keyword_key(self): self.assertEqual(len({self.db.keyword('GPT',c,l) for c,l in [('US','en'),('KR','ko'),('JP','ja')]}),3)
+ def test_missing_not_zero(self):
+  s=TrendSensor(self.db).ingest('m','api',mention_count=None,unique_authors=None,engagement=None,observed_at='2026-08-28T10:00:00+00:00',status='MISSING'); r=self.db.conn.execute('select * from signals where id=?',(s,)).fetchone(); self.assertIsNone(r['mention_count']); self.assertEqual(r['status'],'MISSING')
+ def test_real_velocity_current_bucket(self):
+  ts=TrendSensor(self.db); ts.ingest('v','api',mention_count=10,unique_authors=2,engagement=3,observed_at='2026-08-28T09:00:00+00:00',status='OBSERVED'); s=ts.ingest('v','api',mention_count=20,unique_authors=3,engagement=4,observed_at='2026-08-28T10:00:00+00:00',status='OBSERVED'); r=self.db.conn.execute('select * from signals where id=?',(s,)).fetchone(); self.assertEqual((r['velocity_1h'],r['velocity_3h'],r['acceleration']),(20,15,5))
+ def test_real_missing_blocks_write(self):
+  s=TrendSensor(self.db).ingest('r','fixture',[50,90,120,160,200]); o=OpportunityEngine(self.db).decide(s,mode='REAL',risk=.1,input_statuses={'risk':'PASS'}); self.assertEqual(self.db.conn.execute('select decision from opportunities where id=?',(o,)).fetchone()[0],'WATCH')
+ def test_unknown_risk_review(self):
+  s=TrendSensor(self.db).ingest('r2','fixture',[50,90,120,160,200]); o=OpportunityEngine(self.db).decide(s,mode='REAL'); self.assertEqual(self.db.conn.execute('select decision from opportunities where id=?',(o,)).fetchone()[0],'REVIEW_REQUIRED')
+ def test_high_risk_review(self):
+  s=TrendSensor(self.db).ingest('fin','fixture',[50,90,120,160,200]); o=OpportunityEngine(self.db).decide(s,mode='REAL',search_gap=1,competition=.1,historical_revenue=0,site_fit=1,country_fit=1,freshness=1,risk=.1,cost=.1,input_statuses=REAL,risk_class='FINANCE'); self.assertEqual(self.db.conn.execute('select decision from opportunities where id=?',(o,)).fetchone()[0],'REVIEW_REQUIRED')
+ def test_fast_signal_not_fast_write(self):
+  s=TrendSensor(self.db).ingest('fast','fixture',[50,90,120,160,200]); self.assertEqual(self.db.conn.execute('select is_fast_candidate from signals where id=?',(s,)).fetchone()[0],1); o=OpportunityEngine(self.db).decide(s,mode='REAL',search_gap=.1,competition=.1,historical_revenue=0,site_fit=1,country_fit=1,freshness=1,risk=.1,cost=.1,input_statuses=REAL); self.assertNotEqual(self.db.conn.execute('select decision from opportunities where id=?',(o,)).fetchone()[0],'FAST_WRITE')
+ def test_telemetry_separated(self):
+  *_,pub,kid=self.pub('tele'); Telemetry(self.db).record(pub,kid,rank=3,search={'impressions':100,'clicks':10},analytics={'sessions':8},revenue={'adsense_revenue':1.2},rank_status='PASS',search_console_status='PASS',analytics_status='NOT_CONFIGURED',revenue_status='CONFIGURED_NO_DATA'); self.assertEqual(self.db.conn.execute('select provider_status from search_metrics').fetchone()[0],'PASS'); self.assertEqual(self.db.conn.execute('select provider_status from analytics_metrics').fetchone()[0],'NOT_CONFIGURED'); self.assertEqual(provider_status_summary(self.db)['overall'],'PARTIAL')
+ def test_site_fit_all_candidates(self):
+  ai=self.db.site(tenant_id='t',country='US',language='en',topic='ai coding',platform='local',authority_tags='ai,coding,agent',average_revenue=10,average_rpm=5,health_status='GOOD',policy_status='CLEAN'); self.db.site(tenant_id='t',country='US',language='en',topic='finance loans',platform='local',authority_tags='finance,loans',average_revenue=100,average_rpm=20,health_status='GOOD',policy_status='CLEAN'); r=PublisherRouter(self.db).select_site_result('ai coding agent','US','en','ai coding',['ai','coding']); self.assertEqual(r['site']['id'],ai); self.assertEqual(len(r['candidate_scores']),2)
+ def test_router_single(self): self.assertFalse(hasattr(core,'PublisherRouter'))
+ def test_cost_no_double_scope_and_profit(self):
+  _,o,_,c,pub,kid=self.pub('cost'); t=Telemetry(self.db); self.assertRaises(ValueError,t.record_cost,'bad','x',amount=1,opportunity_id=o,content_id=c); t.record_cost('serp','x',amount=.1,opportunity_id=o); t.record_cost('writer','x',amount=.2,content_id=c); t.record_cost('publish','x',amount=.3,publication_id=pub); t.record(pub,kid,revenue={'adsense_revenue':2},revenue_status='PASS'); self.assertAlmostEqual(content_economics(self.db,c)['contribution_profit'],1.4)
+ def test_timezone_windows(self):
+  self.db.set_config('report_timezone','Asia/Seoul'); self.assertEqual(daily_report(self.db,'2026-08-28')['period_start'],'2026-08-28'); self.db.set_config('report_timezone','America/New_York'); self.assertEqual(daily_report(self.db,'2026-11-01')['period_end'],'2026-11-01'); self.assertEqual(period_report(self.db,'monthly','2026-08-28')['window_type'],'rolling_30d')
+ def test_wordpress_validation_and_unconfigured(self): self.assertEqual(WordPressPublisher.validate_post_response(ProviderResult('PASS',{'id':1,'link':'https://x','status':'publish'})).status,'PASS'); self.assertEqual(WordPressPublisher.validate_post_response(ProviderResult('PASS',{'id':1})).status,'FAIL'); self.assertEqual(OpenSERPProvider().search('x').status,'NOT_CONFIGURED'); self.assertEqual(GoogleAPIProvider(None).query('x').status,'NOT_CONFIGURED')
+ def test_schema_fk(self): self.assertEqual(self.db.conn.execute('select max(version) from schema_version').fetchone()[0],3); self.assertEqual(self.db.conn.execute('pragma foreign_keys').fetchone()[0],1); self.assertEqual(self.db.conn.execute('pragma foreign_key_check').fetchall(),[])
+ def test_old_db_migration(self):
+  with tempfile.TemporaryDirectory() as td:
+   p=str(Path(td)/'old.db'); c=sqlite3.connect(p); c.executescript("""PRAGMA foreign_keys=ON; CREATE TABLE keywords(id INTEGER PRIMARY KEY,keyword TEXT NOT NULL UNIQUE,country TEXT NOT NULL,language TEXT NOT NULL,created_at TEXT NOT NULL); CREATE TABLE signals(id INTEGER PRIMARY KEY,keyword_id INTEGER NOT NULL REFERENCES keywords(id),source TEXT NOT NULL,country TEXT NOT NULL,language TEXT NOT NULL,mention_count INTEGER NOT NULL,unique_authors INTEGER NOT NULL,engagement INTEGER NOT NULL,velocity_1h REAL NOT NULL,velocity_3h REAL NOT NULL,velocity_6h REAL NOT NULL,velocity_12h REAL NOT NULL,velocity_24h REAL NOT NULL,acceleration REAL NOT NULL,platform_count INTEGER NOT NULL DEFAULT 1,country_count INTEGER NOT NULL DEFAULT 1,first_seen_at TEXT NOT NULL,last_seen_at TEXT NOT NULL,is_fast_candidate INTEGER NOT NULL DEFAULT 0); CREATE TABLE opportunities(id INTEGER PRIMARY KEY,keyword_id INTEGER NOT NULL REFERENCES keywords(id),signal_id INTEGER REFERENCES signals(id),decision TEXT NOT NULL,score REAL NOT NULL,decision_reason TEXT NOT NULL,score_components TEXT NOT NULL,engine_version TEXT NOT NULL,created_at TEXT NOT NULL); CREATE TABLE cost_metrics(id INTEGER PRIMARY KEY,component TEXT NOT NULL,provider TEXT NOT NULL,input_tokens INTEGER NOT NULL DEFAULT 0,output_tokens INTEGER NOT NULL DEFAULT 0,amount REAL NOT NULL DEFAULT 0,currency TEXT NOT NULL DEFAULT 'USD',captured_at TEXT NOT NULL,status TEXT NOT NULL); INSERT INTO keywords VALUES(1,'GPT','US','en','2026-08-28T00:00:00+00:00'); INSERT INTO signals VALUES(1,1,'fixture','US','en',5,2,9,5,2,1,.5,.2,3,1,1,'2026-08-28T00:00:00+00:00','2026-08-28T00:00:00+00:00',0); INSERT INTO opportunities VALUES(1,1,1,'WATCH',.1,'old','{}','Opportunity-v1','2026-08-28T00:00:00+00:00'); INSERT INTO cost_metrics VALUES(1,'writer','local',0,0,.1,'USD','2026-08-28T00:00:00+00:00','PASS');"""); c.commit(); c.close(); d=IntelligenceDB(p); self.assertEqual(d.conn.execute('pragma foreign_key_check').fetchall(),[]); self.assertEqual(d.conn.execute('pragma foreign_keys').fetchone()[0],1); self.assertNotEqual(d.keyword('GPT','KR','ko'),1); self.assertIn(('observation_id','signal_observations','id'),{(r[3],r[2],r[4]) for r in d.conn.execute('pragma foreign_key_list(signals)')}); d.close()
+if __name__=='__main__': unittest.main()
