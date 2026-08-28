@@ -30,4 +30,7 @@ class MvpTest(unittest.TestCase):
         site=self.db.site(tenant_id="t",country="US",language="en",topic="tools",platform="local",average_rpm=4)
         self.assertEqual(PublisherRouter(self.db).select_site("x","US","en","tools")["id"],site)
 
+    def test_telemetry_checkpoints_and_period_report(self):
+        sid=TrendSensor(self.db).ingest("checkpoint","fixture",[2,4,6,8,10]); oid=OpportunityEngine(self.db).decide(sid); site=self.db.site(tenant_id="t",country="US",language="en",topic="x",platform="local"); e=Editorial(self.db); plan=e.plan(oid,site,"EXPERIMENT",[],"informational",[]); cid=e.article(plan,"x","y"); pub=LocalPublisher(self.db).publish(cid,site,tempfile.mkdtemp()); kid=self.db.conn.execute("SELECT keyword_id FROM opportunities WHERE id=?",(oid,)).fetchone()[0]; Telemetry(self.db).record(pub,kid,checkpoint="7d"); self.assertEqual(self.db.conn.execute("SELECT checkpoint FROM rank_history").fetchone()[0],"7d"); self.assertEqual(period_report(self.db,"weekly")["period"],"weekly")
+
 if __name__ == "__main__": unittest.main()

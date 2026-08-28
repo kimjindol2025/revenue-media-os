@@ -54,18 +54,18 @@ CREATE TABLE IF NOT EXISTS publications (
 );
 CREATE TABLE IF NOT EXISTS rank_history (
   id INTEGER PRIMARY KEY, publication_id INTEGER NOT NULL REFERENCES publications(id),
-  keyword_id INTEGER NOT NULL REFERENCES keywords(id), rank INTEGER, captured_at TEXT NOT NULL,
+  keyword_id INTEGER NOT NULL REFERENCES keywords(id), rank INTEGER, checkpoint TEXT NOT NULL DEFAULT 'custom', captured_at TEXT NOT NULL,
   provider_status TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS traffic_metrics (
   id INTEGER PRIMARY KEY, publication_id INTEGER NOT NULL REFERENCES publications(id),
-  captured_at TEXT NOT NULL, impression INTEGER, click INTEGER, ctr REAL,
+  checkpoint TEXT NOT NULL DEFAULT 'custom', captured_at TEXT NOT NULL, impression INTEGER, click INTEGER, ctr REAL,
   google_traffic INTEGER, naver_traffic INTEGER, sns_traffic INTEGER, direct_traffic INTEGER,
   engagement_time REAL, page_views INTEGER, provider_status TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS revenue_metrics (
   id INTEGER PRIMARY KEY, publication_id INTEGER NOT NULL REFERENCES publications(id),
-  captured_at TEXT NOT NULL, adsense_revenue REAL, adpost_revenue REAL, rpm REAL,
+  checkpoint TEXT NOT NULL DEFAULT 'custom', captured_at TEXT NOT NULL, adsense_revenue REAL, adpost_revenue REAL, rpm REAL,
   provider_status TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS experiments (

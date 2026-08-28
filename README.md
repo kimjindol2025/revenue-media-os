@@ -15,6 +15,7 @@ are reported as `NOT_CONFIGURED`; they are never represented as `PASS`.
 python3 -m unittest discover -s tests -v
 PYTHONPATH=src python3 -m revenue_media_os.cli demo --db data/mvp.sqlite3
 PYTHONPATH=src python3 -m revenue_media_os.cli daily-report --db data/mvp.sqlite3
+PYTHONPATH=src python3 -m revenue_media_os.cli period-report weekly --db data/mvp.sqlite3
 ```
 
 The demo uses a local publisher and a recorded SERP fixture. It is an
